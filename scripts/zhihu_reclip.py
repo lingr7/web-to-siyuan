@@ -509,16 +509,43 @@ def get_all_doc_ids(notebook_id=None):
     """
     doc_map = {}  # id -> {id, content, fcontent, hpath}
 
-    # --- 策略1: 标准 type='d' 查询 ---
-    r1 = siyuan_request('/api/query/sql', {
-        'stmt': "SELECT id, content, fcontent, hpath FROM blocks WHERE type = 'd'"
-    })
-    for d in r1.get('data', []):
-        doc_map[d['id']] = d
+    # --- 策略1: box 过滤 + 分页拉取（主策略，实测最准）---
+    # 实测教训（2026-08-16，印象笔记本 13242 篇）：
+    #   - 无 box 过滤的 `WHERE type='d'` 会被截断（只返回 4726/13244）
+    #   - 带 box 过滤 + ORDER BY + LIMIT/OFFSET 分页则完全准确
+    if notebook_id:
+        cnt = siyuan_request('/api/query/sql', {
+            'stmt': f"SELECT count(*) AS c FROM blocks WHERE box = '{notebook_id}' AND type = 'd'"
+        })
+        total = cnt.get('data', [{}])[0].get('c', -1) if cnt.get('code') == 0 else -1
+        offset = 0
+        fetched = 0
+        while True:
+            r1 = siyuan_request('/api/query/sql', {
+                'stmt': (
+                    f"SELECT id, content, fcontent, hpath FROM blocks "
+                    f"WHERE box = '{notebook_id}' AND type = 'd' "
+                    f"ORDER BY id LIMIT 5000 OFFSET {offset}"
+                )
+            })
+            if r1.get('code') != 0:
+                break
+            rows = r1.get('data', [])
+            if not rows:
+                break
+            for d in rows:
+                doc_map[d['id']] = d
+            fetched += len(rows)
+            offset += len(rows)
+            if len(rows) < 5000:
+                break
+        log(f"策略1(box分页): {fetched} 篇（预期 {total}）")
+        if total > 0 and fetched < total:
+            log(f"警告：策略1 拉到 {fetched}/{total}，依赖后续策略补齐", "WARN")
 
     # --- 策略2: DISTINCT root_id 补充 ---
     r2 = siyuan_request('/api/query/sql', {
-        'stmt': "SELECT DISTINCT root_id AS id FROM blocks WHERE root_id != ''"
+        'stmt': f"SELECT DISTINCT root_id AS id FROM blocks WHERE box = '{notebook_id}' AND root_id != ''"
     })
     for d in r2.get('data', []):
         rid = d.get('id', '')
@@ -527,7 +554,7 @@ def get_all_doc_ids(notebook_id=None):
 
     # --- 策略3: hpath != '' 补充 ---
     r3 = siyuan_request('/api/query/sql', {
-        'stmt': "SELECT DISTINCT id, content, fcontent, hpath FROM blocks WHERE hpath != '' AND type = 'd'"
+        'stmt': f"SELECT DISTINCT id, content, fcontent, hpath FROM blocks WHERE box = '{notebook_id}' AND hpath != '' AND type = 'd'"
     })
     for d in r3.get('data', []):
         if d['id'] not in doc_map:
@@ -621,6 +648,91 @@ def get_doc_body_text(doc_id):
     return ' '.join((b.get('content') or '') for b in blocks)
 
 
+def get_all_bodies(notebook_id, doc_ids):
+    """
+    批量获取所有文档正文（一次 SQL 拉全部块，按 root_id 分组）。
+    千条规模下比逐篇查询快 2 个数量级，且能检测"标题正常但正文是剪藏失败"的笔记。
+    失败时降级为逐篇查询（慢但可靠）。
+    """
+    bodies = {}
+    # 先取总行数，用于校验分页拉取无缺漏
+    cnt = siyuan_request('/api/query/sql', {
+        'stmt': f"SELECT count(*) AS c FROM blocks WHERE box = '{notebook_id}' AND type != 'd'"
+    })
+    total = cnt.get('data', [{}])[0].get('c', -1) if cnt.get('code') == 0 else -1
+
+    # 分页拉取（ORDER BY root_id 保证分页稳定，LIMIT 分批防截断）
+    fetched = 0
+    offset = 0
+    while True:
+        sql = (
+            f"SELECT root_id, content FROM blocks "
+            f"WHERE box = '{notebook_id}' AND type != 'd' "
+            f"ORDER BY root_id LIMIT 5000 OFFSET {offset}"
+        )
+        result = siyuan_request('/api/query/sql', {'stmt': sql})
+        if result.get('code') != 0:
+            break
+        rows = result.get('data', [])
+        if not rows:
+            break
+        for b in rows:
+            rid = b.get('root_id', '')
+            if rid:
+                bodies.setdefault(rid, []).append(b.get('content') or '')
+        fetched += len(rows)
+        offset += len(rows)
+        if len(rows) < 5000:
+            break
+
+    if fetched > 0 and (total < 0 or fetched >= total):
+        bodies = {k: ' '.join(v) for k, v in bodies.items()}
+        log(f"批量正文获取成功：{fetched} 个块 → {len(bodies)} 篇文档（预期总数 {total}）")
+        return bodies
+
+    # 降级：逐篇查询
+    log(f"批量正文查询异常（拉到 {fetched}/{total}），降级为逐篇查询", "WARN")
+    bodies = {}
+    for i, did in enumerate(doc_ids):
+        bodies[did] = get_doc_body_text(did)
+        if (i + 1) % 200 == 0:
+            log(f"  正文获取进度: {i + 1}/{len(doc_ids)}")
+    return bodies
+
+
+def extract_target_url(body_text):
+    """
+    从失败笔记正文提取目标知乎 URL（实测 Evernote 失败笔记正文模板）：
+
+        剪藏失败。可在桌面端使用剪藏插件 https://yinxiang.com/... 来保存
+        createTime: ...
+        source: https://www.zhihu.com/question/xxx/answer/yyy?utm_psn=...
+        origin: Evernote/Yinxiang 原文链接: www.zhihu.com/question/xxx/answer/yyy
+
+    规则：优先取「原文链接」或「source:」标记后的第一个知乎内容 URL
+    （answer/pin/article/question），避免把正文里出现的无关知乎链接
+    （people/topic/专栏名格式等）当成目标。无标记时退化为正文第一个知乎 URL。
+    """
+    text = normalize_text(body_text)
+    marker_pattern = re.compile(
+        r'(?:原文链接|source)\s*[:：]?\s*(?:\[[^\]]*\]\()?\s*'
+        r'(?:https?://)?'
+        r'((?:www\.|zhuanlan\.)?(?:fx)?zhihu\.com/[^\s\)\]\}】）\u3000，。,、"\'\'\n\r]+)',
+        re.IGNORECASE
+    )
+    for m in marker_pattern.finditer(text):
+        u = m.group(1).rstrip('.,;:!?')
+        norm = normalize_zhihu_url(u)
+        if detect_url_type(norm) in ('answer', 'pin', 'article', 'question'):
+            return u
+    # 退化：正文第一个知乎 URL
+    urls = extract_zhihu_urls(text)
+    for u in urls:
+        if detect_url_type(normalize_zhihu_url(u)) in ('answer', 'pin', 'article', 'question'):
+            return u
+    return urls[0] if urls else ''
+
+
 def is_failed_note(title, hpath, body_text):
     """
     判断是否为剪藏失败笔记。
@@ -636,16 +748,20 @@ def is_failed_note(title, hpath, body_text):
     # 策略2：标题为"无标题笔记"或"未命名文档"
     title_stripped = title.strip()
     if title_stripped in ('无标题笔记', '未命名文档'):
-        body_urls = extract_zhihu_urls(body_text)
-        if body_urls:
-            return True, f"标题为「{title_stripped}」", body_urls
+        target = extract_target_url(body_text)
+        if target:
+            return True, f"标题为「{title_stripped}」", [target]
 
-    # 策略3：正文含"剪藏失败"标志且含知乎链接
-    failure_markers = ['剪藏失败', '可在桌面端', '使用剪藏插件', '原文链接']
-    if any(m in body_text for m in failure_markers):
-        body_urls = extract_zhihu_urls(body_text)
-        if body_urls:
-            return True, "正文含剪藏失败标志", body_urls
+    # 策略3：正文含剪藏失败标志（双标志防误报）且无实质内容
+    # 实测教训：成功剪藏的长文可能恰好引用"剪藏失败"字样或含大量知乎链接，
+    # 必须要求「剪藏失败」+「剪藏插件」双标志，且去 URL 后正文 < 500 字
+    body_clean = ZHIHU_URL_PATTERN.sub('', normalize_text(body_text))
+    has_clip_fail = ('剪藏失败' in body_text and '剪藏插件' in body_text) \
+        or '可在桌面端使用剪藏插件' in body_text
+    if has_clip_fail and len(body_clean) < 500:
+        target = extract_target_url(body_text)
+        if target:
+            return True, "正文含剪藏失败标志", [target]
 
     # 策略4：正文极短（≤3段）且仅含知乎链接无实质内容
     if body_text and len(body_text) < 300:
@@ -653,9 +769,47 @@ def is_failed_note(title, hpath, body_text):
         # 去掉链接后剩余文字极少
         remaining = ZHIHU_URL_PATTERN.sub('', normalize_text(body_text)).strip()
         if body_urls and len(remaining) < 50:
-            return True, "正文仅含知乎链接无内容", body_urls
+            return True, "正文仅含知乎链接无内容", [extract_target_url(body_text) or body_urls[0]]
+
+    # 策略5：纯图片型剪藏失败——标题正常（文章标题），正文只有一张
+    # "剪藏失败。"截图（文字在图片内部，无法文本检索），知乎链接藏在
+    # 迁移元数据 source: 行里。
+    # 特征：含图片引用（resource-/assets/![），去除图片引用/元数据行/URL
+    # 后剩余文字 < 30 字，且有知乎内容链接
+    if body_text and ('resource-' in body_text or 'assets/' in body_text or '![' in body_text):
+        cleaned = re.sub(r'resource-[0-9a-f]+', '', body_text, flags=re.I)
+        cleaned = re.sub(r'\S+\.(?:jpg|jpeg|png|gif|webp|ico|bmp)', '', cleaned, flags=re.I)
+        cleaned = re.sub(
+            r'(createTime|updateTime|tags|source|origin|latitude|longitude|altitude|author|remember|thumbnail)\s*[::].*',
+            '', cleaned, flags=re.I)
+        cleaned = re.sub(r'https?://\S+', '', cleaned)
+        cleaned = re.sub(r'[\s\-_*#>\|]', '', cleaned)
+        if len(cleaned) < 30:
+            target = extract_target_url(body_text)
+            if target:
+                return True, "纯图片型剪藏失败（source链接）", [target]
 
     return False, "", []
+
+
+def is_image_only_failed(body_text):
+    """
+    检测纯图片型失败笔记（不限于知乎链接）。
+    返回 (is_img_only, source_url)——source_url 为任意域名的来源链接，
+    供扫描阶段记录非知乎的失败剪藏（无法自动重建，仅统计）。
+    """
+    if not body_text or not ('resource-' in body_text or 'assets/' in body_text or '![' in body_text):
+        return False, ''
+    cleaned = re.sub(r'resource-[0-9a-f]+', '', body_text, flags=re.I)
+    cleaned = re.sub(r'\S+\.(?:jpg|jpeg|png|gif|webp|ico|bmp)', '', cleaned, flags=re.I)
+    cleaned = re.sub(
+        r'(createTime|updateTime|tags|source|origin|latitude|longitude|altitude|author|remember|thumbnail)\s*[::].*',
+        '', cleaned, flags=re.I)
+    cleaned = re.sub(r'[\s\-_*#>\|]', '', cleaned)
+    if len(cleaned) >= 30:
+        return False, ''
+    m = re.search(r'source\s*[::]\s*(\S+)', body_text, re.I)
+    return True, (m.group(1) if m else '')
 
 
 def cmd_scan(args):
@@ -679,36 +833,81 @@ def cmd_scan(args):
     log("获取所有文档...")
     docs = get_all_doc_ids(notebook_id)
     state['total_docs'] = len(docs)
-    log(f"共 {len(docs)} 篇文档，开始检测...")
+    log(f"共 {len(docs)} 篇文档")
+
+    # 批量获取全部正文（关键：不能只查标题可疑的笔记——
+    # 大量失败笔记标题正常（如文章标题），正文才是"剪藏失败+原文链接"）
+    log("批量获取全部文档正文...")
+    bodies = get_all_bodies(notebook_id, [d['id'] for d in docs])
+
+    # 安全网：正文数据里的 root_id 与文档清单取并集（防清单遗漏）
+    doc_id_set = {d['id'] for d in docs}
+    extra = [rid for rid in bodies if rid not in doc_id_set]
+    if extra:
+        log(f"正文数据发现 {len(extra)} 篇不在文档清单中，并入检测", "WARN")
+        docs.extend({'id': rid, 'content': '', 'fcontent': '', 'hpath': ''} for rid in extra)
+        state['total_docs'] = len(docs)
+    log(f"共 {len(docs)} 篇文档待检测")
 
     found = 0
+    reason_stats = {}   # 失败原因分类统计（migrate_v3 经验）
+    non_zhihu_failed = state.setdefault('non_zhihu_failed', {})  # doc_id -> {title, url}
     batch_count = 0
     for i, doc in enumerate(docs):
         doc_id = doc['id']
         title = doc.get('content', '') or doc.get('fcontent', '') or ''
         hpath = doc.get('hpath', '')
-
-        # 对疑似笔记才查正文（减少 API 调用）
-        title_norm = normalize_text(title)
-        title_has_url = bool(extract_zhihu_urls(title_norm))
-        title_suspect = title.strip() in ('无标题笔记', '未命名文档') or title_has_url
-
-        body_text = ''
-        if title_suspect:
-            body_text = get_doc_body_text(doc_id)
+        body_text = bodies.get(doc_id, '')
 
         is_failed, reason, urls = is_failed_note(title, hpath, body_text)
+
+        # 复核防线：批量分页偶发不稳定（页边界丢块→正文残缺→误判），
+        # 对批量命中的每篇用逐篇查询复核，以复核结果为准（migrate_v3 教训：宁可慢不可错）
+        if is_failed:
+            recheck_body = get_doc_body_text(doc_id)
+            if recheck_body != body_text:
+                ok2, reason2, urls2 = is_failed_note(title, hpath, recheck_body)
+                if not ok2:
+                    log(f"  复核排除 {hpath or doc_id}（批量正文残缺误报）", "WARN")
+                    is_failed, reason, urls = False, '', []
+                else:
+                    reason, urls = reason2, urls2
 
         if is_failed:
             for url in urls:
                 norm_url = normalize_zhihu_url(url)
                 item = get_item(state, norm_url, create=True, doc_id=doc_id)
                 item['old_hpath'] = hpath
+                item['reason'] = reason
+                # 同一 URL 可能出现在多篇失败笔记（多次剪藏尝试），全部记录
+                ids = item.setdefault('old_doc_ids', [])
+                if doc_id not in ids:
+                    ids.append(doc_id)
                 if item['status'] == 'pending':
                     item['status'] = 'pending'
             found += 1
+            reason_stats[reason] = reason_stats.get(reason, 0) + 1
             if found <= 20 or found % 50 == 0:
                 log(f"  [{found}] {hpath} — {reason}")
+        else:
+            # 非知乎的纯图片型失败剪藏：仅记录统计，无法自动重建
+            # 同样复核防批量正文残缺误报
+            img_only, src_url = is_image_only_failed(body_text)
+            if img_only:
+                recheck_body = get_doc_body_text(doc_id)
+                if recheck_body != body_text:
+                    img_only, src_url = is_image_only_failed(recheck_body)
+            if img_only and src_url and 'zhihu.com' not in src_url:
+                non_zhihu_failed[doc_id] = {
+                    'title': title, 'hpath': hpath, 'source_url': src_url}
+            elif img_only and not src_url and title.strip().startswith('无标题'):
+                # 无标题且纯图片：疑似失败但无链接，也记录备查
+                non_zhihu_failed[doc_id] = {
+                    'title': title, 'hpath': hpath, 'source_url': ''}
+
+        # 进度汇报（千条规模）
+        if (i + 1) % 500 == 0:
+            log(f"  检测进度: {i + 1}/{len(docs)}，已发现 {found} 篇")
 
         # 每50条保存一次状态（防止中途崩溃丢失）
         batch_count += 1
@@ -717,11 +916,27 @@ def cmd_scan(args):
             batch_count = 0
 
     state['scan_time'] = datetime.now().isoformat()
+    state['scan_reason_stats'] = reason_stats
     save_state(state)
 
     total_urls = len(state['items'])
     log("")
     log(f"扫描完成：{found} 篇失败笔记，{total_urls} 个待处理知乎链接")
+    log("")
+    log("失败原因分类统计：")
+    for r, c in sorted(reason_stats.items(), key=lambda x: -x[1]):
+        log(f"  {r:30s} {c:6d}")
+    if non_zhihu_failed:
+        from collections import Counter
+        domains = Counter()
+        for v in non_zhihu_failed.values():
+            u = v.get('source_url', '')
+            d = re.sub(r'https?://(www\.)?', '', u).split('/')[0] if u else '(无链接)'
+            domains[d] += 1
+        log("")
+        log(f"另有 {len(non_zhihu_failed)} 篇纯图片型失败剪藏不含知乎链接（仅记录，无法自动重建）：")
+        for d, c in domains.most_common(10):
+            log(f"  {d:35s} {c:6d}")
     log(f"状态已保存: {STATE_FILE}")
 
     if total_urls > 0:
