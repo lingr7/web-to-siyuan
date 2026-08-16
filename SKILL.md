@@ -129,10 +129,34 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 7. **登录弹窗**：无头访问常弹登录框遮挡"阅读全文"按钮，先 `page.evaluate` 移除 `.signFlowModal, .Modal-wrapper` 再点展开。
 8. **纯图片回答存在**：有的回答正文只有一张图无文字（blocks 里只有 img），不是抓取失败。
 
+## 批量模式：剪藏失败笔记重建（zhihu_reclip.py）
+
+当思源中存在**大量剪藏失败的知乎笔记**（典型来自印象笔记迁移：标题为 URL / "无标题笔记"、正文只含"剪藏失败"和原文链接）时，不要逐条走链路 B，用批量工具：
+
+```bash
+cd scripts
+python zhihu_reclip.py scan      # 扫描识别失败笔记（四重策略防漏）
+python zhihu_reclip.py delete    # 删除旧失败文档
+python zhihu_reclip.py fetch     # 自动生成 articles.json 并调用 zhihu_extract.js 批量抓取
+python zhihu_reclip.py process   # 创建新文档（垃圾过滤+图片内联+fix-assets）
+python zhihu_reclip.py verify    # 验证标题+内容命中率
+python zhihu_reclip.py report    # 最终报告（含可点击 deep link）
+python zhihu_reclip.py status    # 随时查看进度（只读）
+python zhihu_reclip.py reset <hash>  # 重置单条状态重试
+```
+
+要点（千条规模实战设计）：
+- **状态机 + 断点续传**：`pending → deleted → fetched → created → verified → done`，任何时刻中断重跑即恢复
+- **运行数据与代码分离**：状态/缓存/日志写 `D:\zhihu-reclip-data`（环境变量 `RECLIP_DATA_DIR` 覆盖），不污染 skill 目录
+- **扫描四重策略取并集**：思源 SQL 有索引 bug（`type='d'` 批量查询随机漏文档），必须加**文件树 API 递归遍历**兜底
+- **notebook_id 每次校验刷新**：状态里存的笔记本可能已删除/重建
+- API 限流 0.15s、指数退避重试、原子写入（临时文件+rename）
+
 ## Scripts & Docs
 
 - `scripts/zhihu_extract.js` — Playwright 抓取（blocks 结构 + 图片下载），用法 `node zhihu_extract.js <articles.json> [outdir]`
 - `scripts/siyuan_pipeline.py` — 思源写入流水线，子命令 create / rebuild / fix-assets / verify
+- `scripts/zhihu_reclip.py` — 批量模式：剪藏失败笔记扫描/重建/验证（千条规模，断点续传），运行数据写 `D:\zhihu-reclip-data`
 - `examples/articles.example.json` — 输入配置格式示例
 - `docs/siyuan-api-pitfalls.md` — 思源 API 坑位详解
 - `docs/zhihu-anti-scraping.md` — 知乎反爬与抓取要点
