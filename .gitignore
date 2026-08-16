@@ -1,0 +1,15 @@
+# 运行产物
+zhihu_extract/
+articles.json
+*_blocks.json
+imgs/
+
+# 依赖
+node_modules/
+pw-browsers/
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db
