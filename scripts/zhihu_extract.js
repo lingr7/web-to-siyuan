@@ -67,6 +67,34 @@ const EXTRACT_FN = (payload) => {
     seen.add(key);
     return true;
   };
+  // 行内序列化：保留 <a> 超链接为 markdown 语法（知乎外链走 link.zhihu.com/?target= 跳转，解开为真实 URL）
+  const mdInline = (node) => {
+    let out = '';
+    for (const n of node.childNodes) {
+      if (n.nodeType === Node.TEXT_NODE) { out += n.textContent; continue; }
+      if (n.nodeType !== Node.ELEMENT_NODE) continue;
+      const t = n.tagName.toLowerCase();
+      if (t === 'br') { out += '\n'; continue; }
+      if (t === 'img' || t === 'noscript' || t === 'svg' || t === 'button' || t === 'style') continue;
+      if (t === 'a') {
+        let href = n.getAttribute('href') || '';
+        const tm = href.match(/[?&]target=([^&]+)/);
+        if (tm) { try { href = decodeURIComponent(tm[1]); } catch (e) { } }
+        let label = mdInline(n).trim();
+        // 知乎链接卡片（LinkCard）懒加载：标题可能尚未渲染，从卡片节点兜底取
+        if (!label) {
+          const cardTitle = n.querySelector('.LinkCard-title');
+          if (cardTitle) label = (cardTitle.textContent || '').trim();
+        }
+        if (href && label && href !== '#' && !href.startsWith('javascript')) out += `[${label}](${href})`;
+        else if (href && href !== '#' && !href.startsWith('javascript')) out += `[__LINKCARD__](${href})`;
+        else out += label;
+        continue;
+      }
+      out += mdInline(n);
+    }
+    return out;
+  };
   const blocks = [];
   const walk = (node) => {
     for (const child of node.children) {
@@ -80,7 +108,7 @@ const EXTRACT_FN = (payload) => {
       }
       if (tag === 'noscript' || tag === 'svg' || tag === 'button' || tag === 'style') continue;
       if (child.querySelector && child.querySelector('img')) { walk(child); continue; }
-      const text = child.innerText ? child.innerText.trim() : '';
+      const text = mdInline(child).trim();
       if (text) blocks.push({ type: 'text', text });
     }
   };
@@ -104,6 +132,11 @@ async function expandContent(page) {
     if (!clicked) break;
     await page.waitForTimeout(900);
   }
+  // 等待链接卡片（LinkCard）标题懒加载完成，最多 15 秒
+  await page.waitForFunction(
+    () => !document.querySelector('.LinkCard-title.loading'),
+    { timeout: 15000 }
+  ).catch(() => {});
 }
 
 function mergeTextBlocks(blocks) {
@@ -114,6 +147,45 @@ function mergeTextBlocks(blocks) {
     out.push(b);
   }
   return out;
+}
+
+// 补全链接卡片标题：卡片懒加载依赖可视区（不滚动拿不到），改调知乎编辑器元数据 API
+//   GET /api/v4/editor/link_card_infos?scene=pcweb&urls=<逗号连接的URL>
+//   返回 { <url>: { extra_info: "{\"title\": ...}" } }
+async function fillLinkCardTitles(context, blocks, srcUrl) {
+  const urls = new Set();
+  for (const b of blocks) {
+    if (b.type !== 'text') continue;
+    for (const m of b.text.matchAll(/\[__LINKCARD__\]\(([^)]+)\)/g)) urls.add(m[1]);
+  }
+  if (!urls.size) return;
+  const list = Array.from(urls);
+  for (let i = 0; i < list.length; i += 10) {
+    const batch = list.slice(i, i + 10);
+    try {
+      const ep = 'https://www.zhihu.com/api/v4/editor/link_card_infos?scene=pcweb&urls='
+        + encodeURIComponent(batch.join(','));
+      const resp = await context.request.get(ep, { headers: { Referer: srcUrl } });
+      if (!resp.ok()) continue;
+      const data = await resp.json();
+      const titles = {};
+      for (const [u, info] of Object.entries(data || {})) {
+        try {
+          const extra = JSON.parse(info.extra_info || '{}');
+          if (extra.title) titles[u] = extra.title;
+        } catch (e) { }
+      }
+      for (const b of blocks) {
+        if (b.type !== 'text') continue;
+        b.text = b.text.replace(/\[__LINKCARD__\]\(([^)]+)\)/g, (s, u) => {
+          const t = titles[u];
+          return t ? `[${t.replace(/[\[\]]/g, '')}](${u})` : `[链接](${u})`;
+        });
+      }
+    } catch (e) {
+      console.log(`  卡片标题获取失败: ${e.message.split('\n')[0]}`);
+    }
+  }
 }
 
 (async () => {
@@ -162,6 +234,8 @@ function mergeTextBlocks(blocks) {
 
     const imgs = blocks ? blocks.filter((b) => b.type === 'img') : [];
     console.log(`  blocks=${blocks ? blocks.length : 0}, images=${imgs.length}${art.type === 'answer' ? `, 首答即目标: ${matched}` : ''}`);
+
+    if (blocks) await fillLinkCardTitles(context, blocks, art.url);
 
     const savedFiles = [];
     for (let i = 0; i < imgs.length; i++) {

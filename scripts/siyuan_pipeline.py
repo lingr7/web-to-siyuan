@@ -155,17 +155,42 @@ def create_doc(notebook, title, markdown):
     return doc_id
 
 
-def rebuild_doc(doc_id, body, src_url):
-    """重建已有文档: 删全部子块 + insertBlock（updateBlock 对根块不生效）"""
-    r = post_json("/api/query/sql", {"stmt": f"SELECT id FROM blocks WHERE parent_id='{doc_id}'"})
-    for row in r["data"]:
-        post_json("/api/block/deleteBlock", {"blockID": row["id"]})
+def rebuild_doc(doc_id, body, src_url, notebook=None, title=None):
+    """重建已有文档内容，成功返回有效 doc_id（可能变化）。
+
+    踩坑记录（2026-08-16，SiYuan 3.7.3）：
+    - **deleteBlock 参数名是 `id`，不是 `blockID`**：传错参数名返回 code=0 但静默空操作
+      （data=null；正确删除时 data 含 delete 操作记录）——曾因此导致 rebuild 残留旧块+追加新块=内容重复
+    - SQL 查子块随机漏行（索引 bug）→ 查子块用 /api/block/getChildBlocks（实时、不走索引）
+    - 防御：删除后循环校验子块为空；仍失败则 removeDoc 整篇删除 + create 重建（doc_id 会变，需回写）
+    """
     src_md = f"> 来源：[知乎]({src_url})\n\n{body}"
-    resp = post_json("/api/block/insertBlock", {
-        "dataType": "markdown", "data": src_md, "parentID": doc_id, "previousID": "",
-    })
-    if resp.get("code") != 0:
-        raise RuntimeError(f"insertBlock failed: {resp}")
+    deleted = False
+    for _ in range(5):
+        r = post_json("/api/block/getChildBlocks", {"id": doc_id})
+        children = r.get("data") or []
+        if not children:
+            deleted = True
+            break
+        for ch in children:
+            post_json("/api/block/deleteBlock", {"id": ch["id"]})  # 参数名必须是 id（官方文档）；传 blockID 会静默空操作
+        time.sleep(0.3)
+    if deleted:
+        resp = post_json("/api/block/insertBlock", {
+            "dataType": "markdown", "data": src_md, "parentID": doc_id, "previousID": "",
+        })
+        if resp.get("code") != 0:
+            raise RuntimeError(f"insertBlock failed: {resp}")
+        return doc_id
+    # 兜底：deleteBlock 静默失败 → 整篇删除重建
+    if not (notebook and title):
+        raise RuntimeError(f"删子块失败（deleteBlock 静默失败）且缺少 notebook/title 无法兜底: {doc_id}")
+    doc = (post_json("/api/block/getBlockInfo", {"id": doc_id}).get("data") or {})
+    path = doc.get("path")
+    if not path:
+        raise RuntimeError(f"无法获取文档路径: {doc_id}")
+    post_json("/api/filetree/removeDoc", {"notebook": notebook, "path": path})
+    return create_doc(notebook, title, src_md)
 
 
 # ---------- 子命令 ----------
@@ -227,12 +252,16 @@ def cmd_rebuild(args):
             if not body.strip():
                 print(f"[{art['idx']}] SKIP: 生成为空 (blocks={len(data['blocks'])})")
                 continue
-            rebuild_doc(doc_id, body, art["url"])
+            new_doc_id = rebuild_doc(doc_id, body, art["url"], notebook=args.notebook, title=art["title"])
+            if new_doc_id != doc_id:
+                art["docId"] = new_doc_id  # 兜底重建后 doc_id 已变，回写
+                doc_id = new_doc_id
             time.sleep(0.6)
             new_md = export_md(doc_id)
             print(f"[{art['idx']}] OK {old_len} -> {len(new_md)} 字符, 图片 {new_md.count('![')} 张")
         except Exception as e:
             print(f"[{art['idx']}] FAIL: {e}")
+    save_articles(args.articles, articles)  # 回写可能变化的 docId
     cmd_fix_assets(argparse.Namespace(notebook=args.notebook, articles=args.articles,
                                       extract_dir=args.extract_dir))
 

@@ -112,7 +112,8 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 
 1. **端口固定 6806**。52926 等旧端口不可用。
 2. **createDocWithMd 标题不生效**：文档会显示"未命名文档"。必须 `renameDoc` + `setBlockAttrs(custom-sy-title-empty="false", title=...)` 两步都做。
-3. **updateBlock 对文档根块（type=d）静默失败**：返回 code=0 但内容不持久化。改用「SQL 查子块 id → 逐个 deleteBlock → insertBlock(parentID=doc_id)」重建。已验证可持久化。
+3. **updateBlock 对文档根块（type=d）静默失败**：返回 code=0 但内容不持久化。改用「查子块 id → 逐个 deleteBlock → insertBlock(parentID=doc_id)」重建。
+8. **（2026-08-16 修正）deleteBlock 参数名是 `id`，不是 `blockID`**：传 `blockID` 返回 code=0 但静默空操作（data=null；真正删除时 data 含 delete 操作记录）。曾误判为"思源 API bug"，受控对照实验定位为脚本参数名错误——曾因此导致 rebuild 残留旧块 + 追加新块 = 文档内容重复。另：**SQL 查 blocks 表有异步索引延迟，不是随机漏行**（2026-08-16 受控实验：快速写 30 块后 SQL 只报 29，约 4 秒后收敛到 32，同一时刻重复查询结果稳定）。写入后立刻用 SQL 查会"缺行"，这是思源已知设计（数据异步写入索引，官方在 ld246 有说明，关联 issue siyuan-note/siyuan#3212）。查刚写入的块一律用 `/api/block/getChildBlocks`（实时、不走索引）。rebuild_doc 已内置：删除后循环校验 + 失败降级 removeDoc 整篇重建（doc_id 会变，回写 articles.json）。
 4. **/api/asset/upload 落错目录**：上传的文件存到全局 `/data/assets/`，而文档内 `assets/xxx` 相对链接按笔记本目录解析 → 图片 404。修复：用 `/api/file/getFile` 读出，再 `/api/file/putFile` 写到 `/data/<notebook>/assets/`（siyuan_pipeline.py 的 fix-assets 子命令）。
 5. **asset/upload 文件字段名是 `file[]`**，不是 `files[]`/`file`。
 6. **SQL 查询端点是 `/api/query/sql`**，参数名 `stmt`（不是 sql）。图片在导出的 markdown 里是内联语法，SQL 中 type='img' 查不到独立块。
@@ -128,6 +129,8 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 6. **图片下载**：页面内 fetch 会被 CORS 拦截，必须用 `context.request.get(url, {headers: {Referer: 页面URL}})`（走浏览器 Cookie + 带 Referer 绕防盗链）。
 7. **登录弹窗**：无头访问常弹登录框遮挡"阅读全文"按钮，先 `page.evaluate` 移除 `.signFlowModal, .Modal-wrapper` 再点展开。
 8. **纯图片回答存在**：有的回答正文只有一张图无文字（blocks 里只有 img），不是抓取失败。
+9. **超链接保留**（2026-08-16 修复）：抓取时切勿用 `innerText` 提取文本（会丢弃全部 `<a href>`）。`zhihu_extract.js` 的 `mdInline()` 会把 `<a>` 序列化为 `[文本](URL)` markdown，并自动解开知乎 `link.zhihu.com/?target=` 跳转为真实 URL。写入端（createDocWithMd / insertBlock dataType=markdown）原生支持链接语法。注意：verify 命中率会因链接语法略降（SiYuan 导出格式差异），属预期。
+10. **链接卡片（LinkCard）懒加载陷阱**（2026-08-16 修复）：正文里的知乎问题卡片是 `<a>` + `.LinkCard-title.loading`，标题**依赖可视区懒加载**；不滚动的无头抓取拿到的是空标题，若直接丢弃空 label 的 `<a>` 会**静默丢失整批卡片链接**（实测丢 6 个）。修复（已实装 zhihu_extract.js）：a) 空 label 的 `<a>` 先标记为 `[__LINKCARD__](url)`；b) 抓取后批量调知乎编辑器元数据 API `GET /api/v4/editor/link_card_infos?scene=pcweb&urls=<逗号连接>`（用 `context.request.get` 带浏览器 Cookie），从返回的 `extra_info` JSON 取 `title` 回填；失败兜底 `[链接](url)`；c) 另有 `waitForFunction` 等待已加载卡片的兜底。
 
 ## 批量模式：剪藏失败笔记重建（zhihu_reclip.py）
 
