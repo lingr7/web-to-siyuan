@@ -1,4 +1,4 @@
-# zhihu-to-siyuan
+# web-to-siyuan
 
 > 将知乎内容（回答 / 想法 / 专栏）完整抓取并归档为 [思源笔记](https://github.com/siyuan-note/siyuan) 文档 —— 文字完整、图片按原文位置内联保存。
 
@@ -129,7 +129,7 @@ node zhihu_extract.js <articles.json> [outdir]   # outdir 默认 ./zhihu_extract
 ## 📁 目录结构
 
 ```
-zhihu-to-siyuan/
+web-to-siyuan/
 ├── SKILL.md                        # WorkBuddy skill 入口（流程步骤）
 ├── README.md                       # 本文件
 ├── LICENSE

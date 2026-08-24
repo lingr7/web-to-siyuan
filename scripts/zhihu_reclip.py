@@ -45,7 +45,7 @@ DEFAULT_NOTEBOOK = None  # 运行时自动检测
 # 目标笔记本名（剪藏失败笔记在印象笔记迁移后所在笔记本），可用环境变量覆盖
 NOTEBOOK_NAME = os.environ.get("SIYUAN_NOTEBOOK_NAME", "印象笔记")
 
-# 运行数据目录与代码分离（脚本已并入 zhihu-to-siyuan skill 仓，
+# 运行数据目录与代码分离（脚本已并入 web-to-siyuan skill 仓，
 # 状态/缓存/日志等运行数据不能写进 skill 目录）
 WORK_DIR = Path(os.environ.get("RECLIP_DATA_DIR", r"D:\zhihu-reclip-data")).resolve()
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -67,15 +67,19 @@ ZHIHU_URL_PATTERN = re.compile(
     r'https?://(?:www\.|zhuanlan\.|link\.)?(?:fx)?zhihu\.com/[^\s\)\]\}】）\u3000\n\r]*',
     re.IGNORECASE
 )
+# URL 尾部粘连文字修复（印象笔记剪藏正文常见，2026-08-16 实测 3 例）：
+# "answer/92648927resource-xxx"、"answer/117395366https://..." 等
+# 规则：/answer|pin|p/ 的纯数字 ID 之后若直接粘字母或另一个 URL，截断到数字 ID 为止
+URL_TAIL_GARBAGE = re.compile(r'(/(?:answer|pin|p)/\d+)(?:[a-zA-Z].*|https?://.*)$')
 
 # ============================================================
-#  Playwright 抓取链路（来自 zhihu-to-siyuan skill 的经验）
+#  Playwright 抓取链路（来自 web-to-siyuan skill 的经验）
 #  WebFetch 抓知乎：图片全丢、长回答截断、多回答页抓错 → 不可用于批量重建
 #  正确链路：zhihu_extract.js 用本机 Chrome 无头抓取，产出 blocks+图片
 # ============================================================
 
-NODE_WORKSPACE = r"C:\Users\redmi\.workbuddy\binaries\node\workspace"
-NODE_EXE = r"C:\Users\redmi\.workbuddy\binaries\node\versions\22.22.2\node.exe"
+NODE_WORKSPACE = os.environ.get("NODE_WORKSPACE", r"D:\zhihu-node-ws")
+NODE_EXE = os.environ.get("NODE_EXE", r"C:\Users\redmi\.workbuddy\binaries\node\versions\22.22.2\node.exe")
 # zhihu_extract.js 与本脚本同目录（同在 skill 的 scripts/ 下），
 # 可用环境变量覆盖
 ZHIHU_EXTRACT_JS = os.environ.get(
@@ -158,12 +162,20 @@ def extract_zhihu_urls(text):
 
 
 def normalize_zhihu_url(url):
-    """归一化：fxzhihu→zhihu，去跟踪参数"""
-    url = normalize_text(url)
+    """归一化：fxzhihu→zhihu，补 scheme（Playwright goto 必须绝对 URL），去跟踪参数，去尾部粘连"""
+    url = normalize_text(url).strip()
     url = re.sub(r'(fxzhihu\.com)', 'zhihu.com', url)
     url = url.split('?')[0]
     # 去除尾部斜杠
     url = url.rstrip('/')
+    # 无 scheme 的 URL（www.zhihu.com/...）补 https://
+    # 否则 page.goto() 抛 invalid URL；且 scheme 有无不一致会拆成两个 state 键
+    if url and not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    # 尾部粘连文字截断（answer/123abc -> answer/123）
+    m = URL_TAIL_GARBAGE.search(url)
+    if m:
+        url = url[:m.end(1)]
     return url
 
 
@@ -296,7 +308,7 @@ def ensure_notebook_id(state=None):
 
 
 # ============================================================
-#  图片资产处理（来自 zhihu-to-siyuan skill 实战经验）
+#  图片资产处理（来自 web-to-siyuan skill 实战经验）
 #  坑1: /api/asset/upload 文件字段名是 "file[]"，不是 files[]
 #  坑2: 上传落在全局 /data/assets/，文档内 assets/ 相对链接按笔记本目录解析
 #        → 必须 getFile 读出再 putFile 到 /data/<notebook>/assets/
@@ -1055,7 +1067,7 @@ def cmd_prepare(args):
 
 # ============================================================
 #  阶段 3b：Playwright 批量抓取 (fetch)
-#  来自 zhihu-to-siyuan skill 的核心经验：
+#  来自 web-to-siyuan skill 的核心经验：
 #  WebFetch 抓知乎图片全丢/长文截断/抓错回答 → 必须走 Playwright 本机 Chrome
 # ============================================================
 
@@ -1069,10 +1081,24 @@ def generate_articles_json(state, limit=None):
     for h, item in state['items'].items():
         if item['status'] not in ('pending', 'deleted', 'failed_fetch'):
             continue
-        # 已有抓取产出的跳过
+        # 已有有效抓取产出的跳过（读文件内容判定，不能只看存在——
+        # ok:false 的失败文件在磁盘上会把条目永久卡死，无法重抓）
         idx = item.get('idx', '')
-        if idx and (EXTRACT_DIR / f"{idx}_blocks.json").exists():
-            continue
+        if idx:
+            bf = EXTRACT_DIR / f"{idx}_blocks.json"
+            if bf.exists():
+                try:
+                    with open(bf, encoding='utf-8') as f:
+                        d = json.load(f)
+                    if d.get('ok') and d.get('blocks'):
+                        continue
+                except Exception:
+                    pass
+                # 无效文件隔离到 retry_old（带时间戳），允许重新编号重抓
+                try:
+                    shutil.move(str(bf), f"{bf}.invalid.{int(time.time())}")
+                except Exception:
+                    pass
         items.append((h, item))
 
     items.sort(key=lambda x: x[1]['normalized_url'])
@@ -1157,17 +1183,26 @@ def cmd_fetch(args):
         env=env,
     )
 
-    # 检查抓取结果，回填状态
+    # 检查抓取结果，回填状态（以文件内 ok 字段为准，不是文件存在与否）
     EXTRACT_DIR.mkdir(exist_ok=True)
-    fetched, missing = 0, 0
+    fetched, missing, empty_hit = 0, 0, 0
     for a in articles:
         h = a['hash']
         item = state['items'].get(h)
         if not item:
             continue
         bf = EXTRACT_DIR / f"{a['idx']}_blocks.json"
+        ok = False
         if bf.exists():
+            try:
+                with open(bf, encoding='utf-8') as f:
+                    data = json.load(f)
+                ok = bool(data.get('ok')) and len(data.get('blocks') or []) > 0
+            except Exception:
+                ok = False
+        if ok:
             item['status'] = 'fetched'
+            item['error'] = ''
             fetched += 1
         else:
             item['status'] = 'failed_fetch'
@@ -1219,7 +1254,7 @@ def _load_extract_data(item):
             except Exception:
                 pass
     if not title:
-        # pin/无标题场景：取第一个文本块开头（zhihu-to-siyuan 经验）
+        # pin/无标题场景：取第一个文本块开头（web-to-siyuan 经验）
         for b in blocks:
             if b.get('type') == 'text' and (b.get('text') or '').strip():
                 title = b['text'].strip()[:40]
@@ -1372,6 +1407,244 @@ def cmd_process(args):
 
 
 # ============================================================
+#  阶段 4b：逐条 rebuild（在原文档上重建内容，不删除原 doc）
+# ============================================================
+
+def rebuild_doc_inplace(doc_id, body, src_url, notebook_id, title, item_hpath_hint=''):
+    """在原文档上重建内容：删子块 -> insertBlock。
+
+    来自 siyuan_pipeline.py rebuild_doc，适配 zhihu_reclip 的 siyuan_request。
+
+    踩坑记录（2026-08-16，SiYuan 3.7.3）：
+    - deleteBlock 参数名是 ``id``，不是 ``blockID``：传错返回 code=0 但静默空操作
+    - SQL 查子块随机漏行（索引 bug）→ 查子块用 getChildBlocks（实时、不走索引）
+    - **文档"最后一块"保护机制（2026-08-16 实测）：删光子块后 SiYuan 自动补建一个空段落块
+      （type='p'），因此"剩余子块为空"校验永远不成立，会误走兜底 removeDoc+create 导致
+      doc_id 全变。删空判定必须放行剩余的空段落块**
+    - 防御：删除后循环校验；剩余块全为空段落块视为删空；仍失败则 removeDoc 整篇重建（doc_id 会变）
+    """
+    src_md = f"> 来源：[知乎]({src_url})\n\n{body}"
+    deleted = False
+    for _ in range(5):
+        r = siyuan_request('/api/block/getChildBlocks', {'id': doc_id})
+        children = r.get('data') or []
+        # 删空判定：无子块，或剩余子块全是空段落块（文档最后一块保护机制自动补的）
+        if not children or all(
+            (ch.get('type') in ('p', 'b')) and not (ch.get('markdown') or ch.get('content'))
+            for ch in children
+        ):
+            deleted = True
+            break
+        for ch in children:
+            siyuan_request('/api/block/deleteBlock', {'id': ch['id']})
+        time.sleep(0.3)
+
+    if deleted:
+        resp = siyuan_request('/api/block/insertBlock', {
+            'dataType': 'markdown', 'data': src_md, 'parentID': doc_id, 'previousID': '',
+        })
+        if resp.get('code') != 0:
+            raise RuntimeError(f"insertBlock failed: {resp}")
+        # 清理文档尾部残留的空段落块（最后一块保护机制自动补的，insertBlock 后排在末尾）
+        try:
+            tail = siyuan_request('/api/block/getChildBlocks', {'id': doc_id}).get('data') or []
+            for ch in tail:
+                if (ch.get('type') in ('p', 'b')) and not (ch.get('markdown') or ch.get('content')):
+                    siyuan_request('/api/block/deleteBlock', {'id': ch['id']})
+        except Exception:
+            pass
+        return doc_id
+
+    # 兜底：deleteBlock 静默失败 -> 整篇删除重建
+    # （2026-08-16 受控实验验证的 API 语义：
+    #   removeDoc.path = 物理 ID 路径 /<parent_id>/<doc_id>.sy，不带 notebook 前缀
+    #   createDocWithMd.path = 含标题的完整 hpath，title 参数不生效
+    #   getBlockInfo.hpath 恒为 None，层级信息只能靠 state 里的 old_hpath）
+    log(f"  删子块失败，兜底 removeDoc+create: {doc_id}", "WARN")
+    doc_info = siyuan_request('/api/block/getBlockInfo', {'id': doc_id}).get('data') or {}
+    path = doc_info.get('path') or ''
+    if not path:
+        raise RuntimeError(f"无法获取文档路径: {doc_id}")
+    parts = path.lstrip('/').split('/')
+    if parts[0] == notebook_id:
+        parts = parts[1:]
+    rel_path = '/' + '/'.join(parts)
+    siyuan_request('/api/filetree/removeDoc', {'notebook': notebook_id, 'path': rel_path})
+
+    # 在原目录重建：old_hpath 最后一段是旧标题，替换为新标题
+    safe_title = title.replace('/', '／').strip() or '未命名'
+    if '/' in item_hpath_hint:
+        create_path = item_hpath_hint.rsplit('/', 1)[0] + '/' + safe_title
+    else:
+        create_path = '/' + safe_title
+    result = siyuan_request('/api/filetree/createDocWithMd', {
+        'notebook': notebook_id, 'path': create_path, 'markdown': src_md,
+    })
+    new_doc_id = result.get('data', '')
+    if not new_doc_id:
+        raise RuntimeError(f"createDocWithMd failed: {result}")
+    return new_doc_id
+
+
+def fix_doc_title(notebook_id, doc_id, title):
+    """修复文档标题（两步缺一不可——skill 核心经验）"""
+    r1 = siyuan_request('/api/filetree/renameDoc', {
+        'notebook': notebook_id,
+        'path': f'/{doc_id}.sy',
+        'title': title,
+    })
+    r2 = siyuan_request('/api/attr/setBlockAttrs', {
+        'id': doc_id,
+        'attrs': {
+            'custom-sy-title-empty': 'false',
+            'title': title,
+        },
+    })
+    return r1.get('code') == 0 and r2.get('code') == 0
+
+
+def cmd_rebuild(args):
+    """逐条 rebuild：在原文档上重建内容（不删除原 doc，保留原路径和 doc_id）"""
+    log("=" * 60)
+    log("阶段 4b：逐条 rebuild（在原文档上重建内容）")
+    log("=" * 60)
+
+    state = load_state()
+    if not state.get('items'):
+        log("状态为空，请先运行 scan", "ERROR")
+        sys.exit(1)
+
+    notebook_id = ensure_notebook_id(state)
+    if not notebook_id:
+        sys.exit(1)
+
+    EXTRACT_DIR.mkdir(exist_ok=True)
+
+    # 筛选需要 rebuild 的条目
+    rebuildable = ('pending', 'fetched', 'failed_create', 'deleted', 'failed_rebuild')
+    to_rebuild = [(h, item) for h, item in state['items'].items()
+                  if item['status'] in rebuildable]
+
+    log(f"待 rebuild: {len(to_rebuild)} 篇")
+    if not to_rebuild:
+        log("没有待 rebuild 的笔记（可能已全部完成，或需先 fetch）")
+        return
+
+    rebuilt, failed, skipped = 0, 0, 0
+    limit = getattr(args, 'limit', None)
+    if limit:
+        to_rebuild = to_rebuild[:limit]
+        log(f"  (limit={limit})")
+
+    for i, (h, item) in enumerate(to_rebuild):
+        url = item['normalized_url']
+        # rebuild 主键是 old_doc_id（scan 阶段写入）；rebuild 中 doc_id 变化后写 doc_id
+        doc_id = item.get('doc_id', '') or item.get('old_doc_id', '')
+        idx = item.get('idx', '')
+
+        if not doc_id:
+            log(f"  [{i+1}/{len(to_rebuild)}] 跳过 {h}: 无 doc_id", "WARN")
+            skipped += 1
+            continue
+
+        # 读取抓取数据
+        extract = _load_extract_data(item)
+        if not extract:
+            log(f"  [{i+1}/{len(to_rebuild)}] 跳过 {h}: 无抓取内容 (需先 fetch)", "WARN")
+            if item['status'] != 'failed_fetch':
+                item['status'] = 'failed_fetch'
+                item['error'] = 'rebuild 时无抓取内容'
+            skipped += 1
+            save_state(state)
+            continue
+
+        title, body = extract
+
+        if not body.strip():
+            log(f"  [{i+1}/{len(to_rebuild)}] 跳过 {h}: 正文为空", "WARN")
+            item['status'] = 'failed_rebuild'
+            item['error'] = '正文为空'
+            skipped += 1
+            save_state(state)
+            continue
+
+        log(f"  [{i+1}/{len(to_rebuild)}] rebuild: {title[:50]}")
+
+        try:
+            # 1) 重建内容（删子块 + insertBlock）
+            old_len = len(export_md_content(doc_id))
+            new_doc_id = rebuild_doc_inplace(doc_id, body, url, notebook_id, title,
+                                             item_hpath_hint=item.get('old_hpath', ''))
+
+            if new_doc_id != doc_id:
+                log(f"    doc_id 变化: {doc_id[:16]}... -> {new_doc_id[:16]}...", "WARN")
+                item['doc_id'] = new_doc_id
+                doc_id = new_doc_id
+            else:
+                # 未变化也回写，保证 verify/report 能明确区分"重建保留原 doc"
+                item['doc_id'] = doc_id
+            # 2) 修复标题（两步缺一不可）
+            title_ok = fix_doc_title(notebook_id, doc_id, title)
+
+            # 3) 图片资产归位（逐条执行，确保图片可访问）
+            fix_assets(notebook_id, [doc_id])
+
+            # 4) 验证内容命中率
+            new_md = export_md_content(doc_id)
+            new_len = len(new_md)
+
+            hit_rate = -1
+            bf = EXTRACT_DIR / f"{idx}_blocks.json" if idx else None
+            if bf and bf.exists():
+                norm = lambda s: "".join((s or '').split())
+                md_norm = norm(new_md)
+                try:
+                    with open(bf, encoding='utf-8') as f:
+                        blocks_data = json.load(f).get('blocks', [])
+                    texts = [b['text'] for b in blocks_data
+                             if b.get('type') == 'text' and (b.get('text') or '').strip()
+                             and not is_junk_text(b['text'])]
+                    if texts:
+                        hit = sum(1 for t in texts if norm(t)[:15] in md_norm)
+                        hit_rate = hit * 100 // len(texts)
+                except Exception:
+                    pass
+
+            # 5) 更新状态
+            item['status'] = 'rebuilt' if title_ok else 'rebuilt_title_issue'
+            item['title'] = title
+            item['hit_rate'] = hit_rate
+            item['old_len'] = old_len
+            item['new_len'] = new_len
+
+            img_count = new_md.count('![')
+            status_parts = [f"{old_len}->{new_len}字符", f"图片{img_count}张"]
+            if hit_rate >= 0:
+                status_parts.append(f"命中{hit_rate}%")
+            if not title_ok:
+                status_parts.append("标题修复异常")
+                log(f"    标题修复异常: {title[:50]}", "WARN")
+
+            log(f"    OK: {', '.join(status_parts)}")
+            rebuilt += 1
+
+        except Exception as e:
+            item['status'] = 'failed_rebuild'
+            item['error'] = str(e)
+            item['attempts'] = item.get('attempts', 0) + 1
+            failed += 1
+            log(f"    FAIL: {e}", "ERROR")
+
+        item['last_attempt'] = datetime.now().isoformat()
+
+        # 每条存盘（断点续传——逐条 rebuild 的核心优势）
+        save_state(state)
+
+    log(f"rebuild 完成: 成功 {rebuilt}, 失败 {failed}, 跳过 {skipped}")
+    log("下一步: python zhihu_reclip.py verify  (或 report)")
+
+
+# ============================================================
 #  阶段 5：验证 (verify)
 # ============================================================
 
@@ -1387,10 +1660,11 @@ def cmd_verify(args):
     norm = lambda s: "".join((s or '').split())
 
     for h, item in state['items'].items():
-        if item['status'] not in ('created', 'created_title_issue', 'verified', 'done'):
+        if item['status'] not in ('created', 'created_title_issue', 'rebuilt', 'rebuilt_title_issue', 'verified', 'done'):
             continue
 
-        new_doc_id = item.get('new_doc_id', '')
+        # rebuild 用 doc_id/old_doc_id，process 用 new_doc_id
+        new_doc_id = item.get('new_doc_id', '') or item.get('doc_id', '') or item.get('old_doc_id', '')
         if not new_doc_id:
             continue
 
@@ -1552,8 +1826,8 @@ def cmd_report(args):
     for h, item in items.items():
         s = item['status']
         report['summary'][s] = report['summary'].get(s, 0) + 1
-        if s in ('verified', 'done'):
-            doc_id = item.get('new_doc_id', '')
+        if s in ('verified', 'done', 'rebuilt'):
+            doc_id = item.get('new_doc_id', '') or item.get('doc_id', '') or item.get('old_doc_id', '')
             report['success_items'].append({
                 'url': item['normalized_url'],
                 'title': item.get('title', ''),
@@ -1561,7 +1835,7 @@ def cmd_report(args):
                 'deep_link': f"{SIYUAN_API}/stage/build/desktop/?id={doc_id}" if doc_id else '',
                 'hit_rate': item.get('hit_rate', -1),
             })
-        elif s.startswith('failed') or s == 'created_title_issue':
+        elif s.startswith('failed') or s in ('created_title_issue', 'rebuilt_title_issue'):
             err = item.get('error', '')
             cat = categorize_error(err)
             report['failure_categories'][cat] = report['failure_categories'].get(cat, 0) + 1
@@ -1662,6 +1936,9 @@ def main():
                          help='本次最多抓取 N 个 URL（千条规模分批用）')
     p_process = sub.add_parser('process', help='读取抓取内容，创建新笔记')
     p_process.add_argument('--path', default='/', help='创建路径（默认 /）')
+    p_rebuild = sub.add_parser('rebuild', help='逐条在原文档上重建内容（不删除原 doc）')
+    p_rebuild.add_argument('--limit', type=int, default=None,
+                           help='本次最多 rebuild N 篇（大批量分批用）')
     sub.add_parser('verify', help='验证文档标题')
     sub.add_parser('status', help='查看当前进度')
     p_reset = sub.add_parser('reset', help='重置失败项以便重试')
@@ -1684,6 +1961,7 @@ def main():
         'prepare': cmd_prepare,
         'fetch': cmd_fetch,
         'process': cmd_process,
+        'rebuild': cmd_rebuild,
         'verify': cmd_verify,
         'status': cmd_status,
         'reset': cmd_reset,

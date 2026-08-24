@@ -1,8 +1,9 @@
-// 知乎内容抓取脚本 v3（Playwright + 本机真实 Chrome 无头模式）
+// 网页内容抓取脚本 v3（Playwright + 本机真实 Chrome 无头模式）
 //
 // 用法:
 //   node zhihu_extract.js <articles.json> [outdir]
-//   - articles.json: [{"idx":"01","type":"answer|pin|article","url":"...","id":"可选，默认从URL推导"}]
+//   - articles.json: [{"idx":"01","type":"answer|pin|article|weixin","url":"...","id":"可选，默认从URL推导"}]
+//   - type: answer=知乎回答, pin=知乎想法, article=知乎专栏, weixin=微信公众号文章(mp.weixin.qq.com)
 //   - outdir 默认 ./zhihu_extract
 //
 // 运行前环境变量（Windows 示例）:
@@ -16,6 +17,10 @@
 //    图片 URL 就在 data-original/data-actualsrc 属性里，无需真正加载
 // 3. 回答页用 data-zop.itemId 精确锚定目标回答，避免排序变化抓错
 // 4. 图片用 context.request.get 下载（带浏览器 Cookie、不受 CORS 限制），必须带 Referer 绕过防盗链
+// 5. 微信公众号文章（weixin）：
+//    - 正文容器 #js_content（懒加载图片在 data-src 属性，src 常为空）
+//    - 图片域 mmbiz.qpic.cn，需带 Referer 下载（mp.weixin.qq.com 或文章 URL 均可）
+//    - 链接卡片懒加载不适用（无 LinkCard），标题由调用方从 #activity-name 取
 const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
@@ -31,15 +36,20 @@ const OUT_DIR = process.argv[3] ? path.resolve(process.argv[3]) : path.join(proc
 const IMG_DIR = path.join(OUT_DIR, 'imgs');
 fs.mkdirSync(IMG_DIR, { recursive: true });
 
-// 从 URL 推导内容 ID（用于 data-zop 锚定）
+// 从 URL 推导内容 ID（用于 data-zop 锚定；weixin/无 id 返回空）
 function deriveId(art) {
   if (art.id) return String(art.id);
   const m = art.url.match(/\/(?:answer|pin|p)\/(\d+)/);
   return m ? m[1] : '';
 }
 
+// 取图片真实 URL：知乎 data-original/data-actualsrc，微信 data-src（懒加载 src 为空）
+// 注意：必须定义在 EXTRACT_FN 内部（evaluate 序列化只带函数体，外部引用会 ReferenceError）
 const EXTRACT_FN = (payload) => {
   const { type, id } = payload;
+  const pickImgSrc = (img) =>
+    img.getAttribute('data-src') || img.getAttribute('data-original') ||
+    img.getAttribute('data-actualsrc') || img.getAttribute('src') || '';
   let container = null;
   if (type === 'answer') {
     const items = Array.from(document.querySelectorAll('.AnswerItem'));
@@ -54,14 +64,17 @@ const EXTRACT_FN = (payload) => {
     container = items.length ? items[0].querySelector('.RichContent-inner') || items[0] : null;
   } else if (type === 'article') {
     container = document.querySelector('.Post-RichTextContainer');
+  } else if (type === 'weixin') {
+    // 微信公众号文章正文：.rich_media_content 是稳定容器，#js_content 是内部实际内容
+    container = document.querySelector('#js_content') || document.querySelector('.rich_media_content');
   }
   if (!container) return null;
 
   const imgId = (src) => { const m = src.match(/v2-([0-9a-f]+)/); return m ? m[1] : src; };
   const seen = new Set();
   const isContentImg = (img) => {
-    const src = img.getAttribute('data-original') || img.getAttribute('data-actualsrc') || img.getAttribute('src') || '';
-    if (!src.includes('zhimg.com/v2-')) return false;
+    const src = pickImgSrc(img);
+    if (!src.includes('zhimg.com/v2-') && !src.includes('mmbiz.qpic.cn')) return false;
     const key = imgId(src);
     if (seen.has(key)) return false;
     seen.add(key);
@@ -101,8 +114,7 @@ const EXTRACT_FN = (payload) => {
       const tag = child.tagName.toLowerCase();
       if (tag === 'img') {
         if (isContentImg(child)) {
-          const src = child.getAttribute('data-original') || child.getAttribute('data-actualsrc') || child.getAttribute('src') || '';
-          blocks.push({ type: 'img', src });
+          blocks.push({ type: 'img', src: pickImgSrc(child) });
         }
         continue;
       }
@@ -188,7 +200,8 @@ async function fillLinkCardTitles(context, blocks, srcUrl) {
   }
 }
 
-(async () => {
+// 启动浏览器（launch + context + 反检测），浏览器崩溃后靠它重启
+async function launchBrowser() {
   const browser = await chromium.launch({
     channel: 'chrome',          // 关键：用本机真实 Chrome
     headless: true,             // 新无头模式，指纹与真浏览器几乎一致
@@ -207,77 +220,140 @@ async function fillLinkCardTitles(context, blocks, srcUrl) {
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
   });
   const page = await context.newPage();
+  return { browser, context, page };
+}
 
+(async () => {
+  let { browser, context, page } = await launchBrowser();
   const results = [];
+
   for (const art of ARTICLES) {
     const id = deriveId(art);
     console.log(`[${art.idx}] ${art.url}`);
     let blocks = null;
     let matched = null;
-    try {
-      await page.goto(art.url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      await page.waitForTimeout(2500);
-      await expandContent(page);
-      await page.waitForTimeout(1200);
-      // 不做全页滚动（虚拟列表会移除目标节点）
-      blocks = await page.evaluate(EXTRACT_FN, { type: art.type, id });
-      if (art.type === 'answer') {
-        matched = await page.evaluate((qid) => {
-          const first = document.querySelector('.AnswerItem');
-          if (!first) return null;
-          try { return JSON.parse(first.getAttribute('data-zop') || '{}').itemId === qid; } catch (e) { return null; }
-        }, id);
+    let deleted = false;
+    let httpStatus = -1;
+
+    // 单条最多重试 3 次：知乎批量访问偶发 403 降级页（正文不渲染），重开新页重试可恢复
+    for (let attempt = 1; attempt <= 3 && blocks === null && !deleted; attempt++) {
+      try {
+        if (attempt > 1) {
+          try { await page.close(); } catch (e) {}
+          page = await context.newPage();
+          console.log(`  重试 #${attempt - 1}`);
+        }
+        const resp = await page.goto(art.url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch((e) => null);
+        httpStatus = resp ? resp.status() : -1;
+        if (httpStatus === 403) console.log(`  HTTP 403（知乎风控降级页），等待正文渲染…`);
+        // 条件等待：目标容器出现（最长 25 秒），403 降级页正文渲染很慢
+        await page.waitForFunction(({ type }) => {
+          if (type === 'answer') return document.querySelectorAll('.AnswerItem').length > 0;
+          if (type === 'pin') return document.querySelectorAll('.PinItem').length > 0;
+          if (type === 'article') return !!document.querySelector('.Post-RichTextContainer');
+          if (type === 'weixin') return !!document.querySelector('#js_content');
+          return !!(document.body && document.body.innerText && document.body.innerText.length > 0);
+        }, { type: art.type }, { timeout: 25000 }).catch(() => {});
+        await page.waitForTimeout(2500);
+        await expandContent(page);
+        await page.waitForTimeout(1200);
+        // 不做全页滚动（虚拟列表会移除目标节点）
+        blocks = await page.evaluate(EXTRACT_FN, { type: art.type, id });
+        if (art.type === 'answer') {
+          matched = await page.evaluate((qid) => {
+            const first = document.querySelector('.AnswerItem');
+            if (!first) return null;
+            try { return JSON.parse(first.getAttribute('data-zop') || '{}').itemId === qid; } catch (e) { return null; }
+          }, id);
+          // 回答被作者删除时页面会提示，直接判定失败不重试
+          if (blocks === null) {
+            deleted = await page.evaluate(() => {
+              const t = document.title + (document.body ? document.body.innerText.slice(0, 500) : '');
+              return t.includes('已被作者删除');
+            });
+          }
+        }
+      } catch (e) {
+        console.log(`  ERROR: ${e.message.split('\n')[0]} (attempt ${attempt})`);
+        // 页面/浏览器可能崩溃：先关页面，必要时重启整个浏览器
+        try { await page.close(); } catch (e2) {}
+        if (attempt >= 3) {
+          try { await browser.close(); } catch (e3) {}
+          const fresh = await launchBrowser();
+          browser = fresh.browser; context = fresh.context; page = fresh.page;
+          console.log('  浏览器已重启');
+        } else {
+          try { page = await context.newPage(); } catch (e4) {
+            const fresh = await launchBrowser();
+            browser = fresh.browser; context = fresh.context; page = fresh.page;
+          }
+        }
+        await page.waitForTimeout(2000).catch(() => {});
       }
-    } catch (e) {
-      console.log(`  ERROR: ${e.message.split('\n')[0]}`);
     }
 
+    if (deleted) console.log('  回答已被作者删除');
     const imgs = blocks ? blocks.filter((b) => b.type === 'img') : [];
     console.log(`  blocks=${blocks ? blocks.length : 0}, images=${imgs.length}${art.type === 'answer' ? `, 首答即目标: ${matched}` : ''}`);
 
-    if (blocks) await fillLinkCardTitles(context, blocks, art.url);
-
-    const savedFiles = [];
-    for (let i = 0; i < imgs.length; i++) {
-      const url = imgs[i].src;
-      try {
-        const resp = await context.request.get(url, { headers: { Referer: art.url } });
-        if (resp.ok()) {
-          const buf = await resp.body();
-          const ct = resp.headers()['content-type'] || '';
-          let ext = 'jpg';
-          if (ct.includes('png')) ext = 'png';
-          else if (ct.includes('gif')) ext = 'gif';
-          else if (ct.includes('webp')) ext = 'webp';
-          const fname = `${art.idx}_${String(i + 1).padStart(2, '0')}.${ext}`;
-          fs.writeFileSync(path.join(IMG_DIR, fname), buf);
-          savedFiles.push(fname);
-          console.log(`    下载 ${fname} (${buf.length} bytes)`);
-        } else {
+    // 整条落盘链兜底 try-catch：浏览器状态异常（如 context 已关闭）不得杀死进程
+    try {
+      if (blocks) await fillLinkCardTitles(context, blocks, art.url);
+      const savedFiles = [];
+      for (let i = 0; i < imgs.length; i++) {
+        const url = imgs[i].src;
+        try {
+          const resp = await context.request.get(url, { headers: { Referer: art.url } });
+          if (resp.ok()) {
+            const buf = await resp.body();
+            const ct = resp.headers()['content-type'] || '';
+            let ext = 'jpg';
+            if (ct.includes('png')) ext = 'png';
+            else if (ct.includes('gif')) ext = 'gif';
+            else if (ct.includes('webp')) ext = 'webp';
+            const fname = `${art.idx}_${String(i + 1).padStart(2, '0')}.${ext}`;
+            fs.writeFileSync(path.join(IMG_DIR, fname), buf);
+            savedFiles.push(fname);
+            console.log(`    下载 ${fname} (${buf.length} bytes)`);
+          } else {
+            savedFiles.push(null);
+            console.log(`    失败 HTTP ${resp.status()}`);
+          }
+        } catch (e) {
           savedFiles.push(null);
-          console.log(`    失败 HTTP ${resp.status()}`);
+          console.log(`    异常: ${e.message.split('\n')[0]}`);
         }
-      } catch (e) {
-        savedFiles.push(null);
-        console.log(`    异常: ${e.message.split('\n')[0]}`);
       }
-    }
-    let imgPos = -1;
-    if (blocks) {
-      for (const b of blocks) {
-        if (b.type === 'img') { imgPos++; b.file = imgPos < savedFiles.length ? savedFiles[imgPos] : null; }
+      let imgPos = -1;
+      if (blocks) {
+        for (const b of blocks) {
+          if (b.type === 'img') { imgPos++; b.file = imgPos < savedFiles.length ? savedFiles[imgPos] : null; }
+        }
       }
+      const rec = { idx: art.idx, type: art.type, url: art.url, ok: !!blocks, firstIsTarget: matched, blocks: blocks ? mergeTextBlocks(blocks) : [] };
+      results.push(rec);
+      fs.writeFileSync(path.join(OUT_DIR, `${art.idx}_blocks.json`), JSON.stringify(rec, null, 2), 'utf8');
+      // 增量写 summary.json：单个处理完就落盘，进程崩溃也不丢已完成结果
+      fs.writeFileSync(path.join(OUT_DIR, 'summary.json'), JSON.stringify(results.map((r) => ({
+        idx: r.idx, ok: r.ok, firstIsTarget: r.firstIsTarget, blocks: r.blocks.length,
+        images: r.blocks.filter((b) => b.type === 'img' && b.file).length,
+      })), null, 2), 'utf8');
+    } catch (e) {
+      console.log(`  落盘异常: ${e.message.split('\n')[0]}`);
+      // 上下文已坏：不写文件，但记录结果避免静默丢失
+      results.push({ idx: art.idx, type: art.type, url: art.url, ok: !!blocks, firstIsTarget: matched, blocks: [] });
     }
-    const rec = { idx: art.idx, type: art.type, url: art.url, ok: !!blocks, firstIsTarget: matched, blocks: blocks ? mergeTextBlocks(blocks) : [] };
-    results.push(rec);
-    fs.writeFileSync(path.join(OUT_DIR, `${art.idx}_blocks.json`), JSON.stringify(rec, null, 2), 'utf8');
-    await page.waitForTimeout(800 + Math.random() * 700); // 轻微间隔防频控
+
+    // 定期重启浏览器释放内存（知乎页面渲染几十个后 Chrome 内存暴涨）
+    if ((results.length + 1) % 15 === 0) {
+      try { await browser.close(); } catch (e) {}
+      const fresh = await launchBrowser();
+      browser = fresh.browser; context = fresh.context; page = fresh.page;
+      console.log(`  [维护] 已处理 ${results.length} 条，重启浏览器释放内存`);
+    }
+    await page.waitForTimeout(1500 + Math.random() * 1200).catch(() => {}); // 间隔拉长防频控
   }
 
-  fs.writeFileSync(path.join(OUT_DIR, 'summary.json'), JSON.stringify(results.map((r) => ({
-    idx: r.idx, ok: r.ok, firstIsTarget: r.firstIsTarget, blocks: r.blocks.length,
-    images: r.blocks.filter((b) => b.type === 'img' && b.file).length,
-  })), null, 2), 'utf8');
   await browser.close();
   console.log('DONE');
 })();

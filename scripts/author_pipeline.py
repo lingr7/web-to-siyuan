@@ -1,55 +1,48 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""网页内容 -> 思源笔记 写入流水线（配合 zhihu_extract.js 使用，支持知乎/微信公众号）
+"""知乎答主合集写入思源：主文档（答主档案）+ 子文档（每篇回答）
 
-子命令:
-  create      从抓取的 blocks 创建新文档（含图片内联 + 标题修复 + 资产归位）
-  rebuild     重建已有文档（文档存在但内容不完整/错误时用）
-  fix-assets  把误存到全局 /data/assets 的图片复制到笔记本 assets 目录
-  verify      核对抓取内容与文档的匹配度
+用法:
+  python author_pipeline.py create --notebook <nb_id> --articles <articles.json> --extract-dir <dir> \
+      --author "罗心澄" --author-token <token> --author-about "<简介>"
+  python author_pipeline.py verify --articles <articles.json> --extract-dir <dir>
 
-用法示例:
-  python siyuan_pipeline.py create --notebook <笔记本ID> --articles articles.json --extract-dir zhihu_extract
-  python siyuan_pipeline.py rebuild --notebook <笔记本ID> --articles articles.json --extract-dir zhihu_extract
-  python siyuan_pipeline.py fix-assets --notebook <笔记本ID> --articles articles.json
-  python siyuan_pipeline.py verify --articles articles.json --extract-dir zhihu_extract
-
-articles.json 中的 docId 字段会在 create 后自动回写，供后续子命令使用。
-
-思源 API 关键坑（均已实测验证）:
-  1. updateBlock 对文档根块(type=d)返回 code=0 但不持久化 —— 必须"删子块 + insertBlock"
-  2. /api/asset/upload 上传的文件落在全局 /data/assets/，而文档内 assets/ 相对链接
-     按笔记本目录解析 —— 需要 putFile 复制到 /data/<notebook>/assets/
-  3. asset/upload 的文件字段名是 "file[]"（不是 files[]）
-  4. SQL 查询端点 /api/query/sql，参数名 stmt
-  5. createDocWithMd 标题不生效 —— 需要 renameDoc + setBlockAttrs(custom-sy-title-empty=false)
+复用 web-to-siyuan skill 的踩坑经验：
+- createDocWithMd 标题不生效 → renameDoc + setBlockAttrs 两步
+- asset/upload 落全局 /data/assets/ → fix-assets 复制到笔记本 assets
+- 子文档: createDocWithMd 的 path 参数用 "/{父文档id}.sy/" 前缀
 """
 import argparse
 import json
 import mimetypes
 import os
 import re
+import sys
 import time
 import urllib.request
 import uuid
 
 API = "http://127.0.0.1:6806"
 
-
-def source_label(url):
-    """按 URL 域名生成来源标注（知乎 / 微信公众号）"""
-    if "mp.weixin.qq.com" in url:
-        return "微信公众号"
-    return "知乎"
-
-
-def source_line(url):
-    return f"> 来源：[{source_label(url)}]({url})"
-
 JUNK_PATTERNS = [
-    re.compile(r"\d+\s*赞同"),
-    re.compile(r"^发布于"),
-    re.compile(r"^编辑于"),
-    re.compile(r"^\d+\s*人赞同了该回答"),
+    re.compile(r"^\d+\s*人赞同了该回答$"),
+    re.compile(r"^赞同\s*\d+$"),
+    re.compile(r"^发布于\s*\d{4}"),
+    re.compile(r"^编辑于\s*\d{4}"),
+    re.compile(r"^收录于"),
+    re.compile(r"^被\s*\d+\s*人收藏"),
+    re.compile(r"^分享$"),
+    re.compile(r"^赞同$"),
+    re.compile(r"^收藏$"),
+    re.compile(r"^喜欢$"),
+    re.compile(r"^评论\s*\d+$"),
+    re.compile(r"^更多$"),
+    re.compile(r"^阅读全文$"),
+    re.compile(r"^收起$"),
+    re.compile(r"^想读$"),
+    re.compile(r"^推荐阅读"),
+    re.compile(r"^·\s*$"),
+    re.compile(r"^\s*$"),
 ]
 
 
@@ -101,7 +94,7 @@ def put_file(path, data, mime):
 
 
 def upload_asset(filepath, rename_prefix):
-    """上传图片资产。注意: 落在全局 /data/assets/，之后需 fix-assets 归位。"""
+    """上传图片资产（落全局 /data/assets/，之后 fix-assets 归位）"""
     filename = f"zhihu_{rename_prefix}_{os.path.basename(filepath)}"
     mime = mimetypes.guess_type(filepath)[0] or "image/jpeg"
     boundary = uuid.uuid4().hex
@@ -151,9 +144,10 @@ def build_body(idx, blocks, img_dir):
     return "\n\n".join(parts)
 
 
-def create_doc(notebook, title, markdown):
+def create_doc(notebook, title, markdown, parent_path="/"):
+    """创建文档。parent_path 传 "/" 或 "/{父文档id}.sy/" 实现子文档"""
     r = post_json("/api/filetree/createDocWithMd", {
-        "notebook": notebook, "path": "/", "markdown": markdown, "title": title,
+        "notebook": notebook, "path": parent_path, "markdown": markdown, "title": title,
     })
     doc_id = r.get("data", "")
     if not doc_id:
@@ -166,49 +160,48 @@ def create_doc(notebook, title, markdown):
     return doc_id
 
 
-def rebuild_doc(doc_id, body, src_url, notebook=None, title=None):
-    """重建已有文档内容，成功返回有效 doc_id（可能变化）。
-
-    踩坑记录（2026-08-16，SiYuan 3.7.3）：
-    - **deleteBlock 参数名是 `id`，不是 `blockID`**：传错参数名返回 code=0 但静默空操作
-      （data=null；正确删除时 data 含 delete 操作记录）——曾因此导致 rebuild 残留旧块+追加新块=内容重复
-    - SQL 查子块随机漏行（索引 bug）→ 查子块用 /api/block/getChildBlocks（实时、不走索引）
-    - 防御：删除后循环校验子块为空；仍失败则 removeDoc 整篇删除 + create 重建（doc_id 会变，需回写）
-    """
-    src_md = f"{source_line(src_url)}\n\n{body}"
-    deleted = False
-    for _ in range(5):
-        r = post_json("/api/block/getChildBlocks", {"id": doc_id})
-        children = r.get("data") or []
-        if not children:
-            deleted = True
-            break
-        for ch in children:
-            post_json("/api/block/deleteBlock", {"id": ch["id"]})  # 参数名必须是 id（官方文档）；传 blockID 会静默空操作
-        time.sleep(0.3)
-    if deleted:
-        resp = post_json("/api/block/insertBlock", {
-            "dataType": "markdown", "data": src_md, "parentID": doc_id, "previousID": "",
-        })
-        if resp.get("code") != 0:
-            raise RuntimeError(f"insertBlock failed: {resp}")
-        return doc_id
-    # 兜底：deleteBlock 静默失败 → 整篇删除重建
-    if not (notebook and title):
-        raise RuntimeError(f"删子块失败（deleteBlock 静默失败）且缺少 notebook/title 无法兜底: {doc_id}")
-    doc = (post_json("/api/block/getBlockInfo", {"id": doc_id}).get("data") or {})
-    path = doc.get("path")
-    if not path:
-        raise RuntimeError(f"无法获取文档路径: {doc_id}")
-    post_json("/api/filetree/removeDoc", {"notebook": notebook, "path": path})
-    return create_doc(notebook, title, src_md)
-
-
 # ---------- 子命令 ----------
 
 def load_articles(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
+
+
+def cmd_gen_articles(args):
+    """从 crawl_state.json 生成 articles.json（按 URL 排序，idx 稳定，仅 verified 的 answer）"""
+    with open(args.state, encoding="utf-8") as f:
+        state = json.load(f)
+    items = [(url, info) for url, info in state.get("discovered", {}).items()
+             if info.get("type") == "answer"]
+    # verified 的优先收录；未 verified 的也保留（verified: false），后续 crawler 补验
+    items.sort(key=lambda kv: kv[0])
+    # 保留已有 docId（避免重复 create 产生重复文档）
+    old = {}
+    if os.path.exists(args.articles):
+        try:
+            with open(args.articles, encoding="utf-8") as f:
+                old = {a["url"]: a.get("docId") or "" for a in json.load(f) if a.get("url")}
+        except Exception:
+            pass
+    articles = []
+    for i, (url, info) in enumerate(items):
+        articles.append({
+            "idx": str(i + 1).zfill(3),
+            "type": "answer",
+            "url": url,
+            "title": (info.get("title") or f"回答 {info.get('answerId', '')}").strip(),
+            "docId": old.get(url, ""),
+            "verified": bool(info.get("verified")),
+            "meta": {
+                "answerId": str(info.get("answerId") or ""),
+                "questionId": str(info.get("questionId") or ""),
+                "foundFrom": info.get("foundFrom") or "",
+            },
+        })
+    with open(args.articles, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+    n_verified = sum(1 for a in articles if a["verified"])
+    print(f"生成 {len(articles)} 条（verified={n_verified}）→ {args.articles}")
 
 
 def save_articles(path, articles):
@@ -229,72 +222,102 @@ def iter_article_blocks(articles, extract_dir):
 
 def cmd_create(args):
     articles = load_articles(args.articles)
+    author_name = args.author or "知乎用户"
+    author_token = args.author_token or ""
+    about = args.author_about or ""
+
+    # 1. 创建主文档（答主档案）
+    profile_md = []
+    profile_md.append(f"# {author_name}（知乎答主合集）")
+    profile_md.append("")
+    profile_md.append(f"> 知乎主页：[{author_name}](https://www.zhihu.com/people/{author_token})")
+    if about:
+        profile_md.append("")
+        profile_md.append(about)
+    profile_md.append("")
+    profile_md.append(f"共收录 **{len(articles)}** 篇回答（递归发现，可能未穷尽全部 1283 篇，因答主开启隐私保护无法直接列出全部）")
+    profile_md.append("")
+    profile_md.append("## 目录")
+    profile_md.append("")
+    for art in articles:
+        title = (art.get("title") or "未命名回答").strip()
+        # 目录块用锚点不方便，直接列问题标题 + 子文档引用由思源文档树呈现
+        profile_md.append(f"- {title}")
+    profile_md.append("")
+
+    parent_doc_id = None
+    profile_title = f"{author_name} - 知乎回答合集"
+    # 先检查是否已存在主文档（幂等）
+    try:
+        r = post_json("/api/query/sql", {
+            "stmt": f"SELECT id FROM blocks WHERE type='d' AND content='{profile_title}' AND box='{args.notebook}' LIMIT 1"
+        })
+        rows = r.get("data") or []
+        if rows:
+            parent_doc_id = rows[0]["id"]
+            print(f"[主文档] 已存在: {parent_doc_id}")
+        else:
+            parent_doc_id = create_doc(args.notebook, profile_title, "\n".join(profile_md))
+            print(f"[主文档] 创建 OK: {parent_doc_id}")
+            print(f"         链接: {API}/stage/build/desktop/?id={parent_doc_id}")
+    except Exception as e:
+        print(f"[主文档] 查询失败，直接创建: {e}")
+        parent_doc_id = create_doc(args.notebook, profile_title, "\n".join(profile_md))
+        print(f"[主文档] 创建 OK: {parent_doc_id}")
+
+    parent_path = f"/{parent_doc_id}.sy/"
+
+    # 2. 创建子文档（每篇回答）
+    ok_count = 0
     for art, data in iter_article_blocks(articles, args.extract_dir):
-        title = art.get("title") or art["url"]
+        title = (art.get("title") or art["url"]).strip()
+        if len(title) > 60:
+            title = title[:60] + "…"
         try:
             body = build_body(art["idx"], data["blocks"], os.path.join(args.extract_dir, "imgs"))
             if not body.strip():
                 print(f"[{art['idx']}] SKIP: 生成为空 (blocks={len(data['blocks'])})")
                 continue
-            md = f"{source_line(art['url'])}\n\n{body}"
-            doc_id = create_doc(args.notebook, title, md)
+            md = f"> 来源：[知乎]({art['url']})\n\n{body}"
+            doc_id = create_doc(args.notebook, title, md, parent_path=parent_path)
             art["docId"] = doc_id
-            time.sleep(0.6)
+            ok_count += 1
+            time.sleep(0.5)
             new_md = export_md(doc_id)
             print(f"[{art['idx']}] OK doc={doc_id} {len(new_md)} 字符, 图片 {new_md.count('![')} 张")
             print(f"       链接: {API}/stage/build/desktop/?id={doc_id}")
         except Exception as e:
             print(f"[{art['idx']}] FAIL: {e}")
-    save_articles(args.articles, articles)  # 回写 docId
-    cmd_fix_assets(argparse.Namespace(notebook=args.notebook, articles=args.articles,
-                                      extract_dir=args.extract_dir))  # 顺手归位资产
+
+    # 3. 回写 docId + 主文档 id
+    with open(os.path.join(os.path.dirname(args.articles), "author_main_doc.json"), "w", encoding="utf-8") as f:
+        json.dump({"mainDocId": parent_doc_id, "notebook": args.notebook}, f, ensure_ascii=False, indent=2)
+    save_articles(args.articles, articles)
+
+    # 4. 资产归位
+    print(f"\n成功创建 {ok_count}/{len(articles)} 个子文档")
+    fix_assets(args.notebook, articles)
 
 
-def cmd_rebuild(args):
-    articles = load_articles(args.articles)
-    for art, data in iter_article_blocks(articles, args.extract_dir):
-        doc_id = art.get("docId")
-        if not doc_id:
-            print(f"[{art['idx']}] SKIP: articles.json 中无 docId")
-            continue
-        old_len = len(export_md(doc_id))
-        try:
-            body = build_body(art["idx"], data["blocks"], os.path.join(args.extract_dir, "imgs"))
-            if not body.strip():
-                print(f"[{art['idx']}] SKIP: 生成为空 (blocks={len(data['blocks'])})")
-                continue
-            new_doc_id = rebuild_doc(doc_id, body, art["url"], notebook=args.notebook, title=art["title"])
-            if new_doc_id != doc_id:
-                art["docId"] = new_doc_id  # 兜底重建后 doc_id 已变，回写
-                doc_id = new_doc_id
-            time.sleep(0.6)
-            new_md = export_md(doc_id)
-            print(f"[{art['idx']}] OK {old_len} -> {len(new_md)} 字符, 图片 {new_md.count('![')} 张")
-        except Exception as e:
-            print(f"[{art['idx']}] FAIL: {e}")
-    save_articles(args.articles, articles)  # 回写可能变化的 docId
-    cmd_fix_assets(argparse.Namespace(notebook=args.notebook, articles=args.articles,
-                                      extract_dir=args.extract_dir))
-
-
-def cmd_fix_assets(args):
-    """把全局 /data/assets 中误存的图片复制到笔记本 assets 目录，使相对链接生效"""
-    articles = load_articles(args.articles)
+def fix_assets(notebook, articles):
     doc_ids = [a["docId"] for a in articles if a.get("docId")]
     if not doc_ids:
         print("fix-assets: 无 docId，跳过")
         return
     asset_paths = set()
     for did in doc_ids:
-        md = export_md(did)
-        asset_paths.update(re.findall(r"!\[.*?\]\((assets/[^)]+)\)", md))
+        try:
+            md = export_md(did)
+            asset_paths.update(re.findall(r"!\[.*?\]\((assets/[^)]+)\)", md))
+        except Exception as e:
+            print(f"fix-assets 导出失败 {did}: {e}")
     ok = 0
     for p in sorted(asset_paths):
         name = os.path.basename(p)
-        nb_path = f"/data/{args.notebook}/assets/{name}"
+        nb_path = f"/data/{notebook}/assets/{name}"
         try:
             get_file(nb_path)
-            ok += 1  # 已存在
+            ok += 1
             continue
         except Exception:
             pass
@@ -334,31 +357,32 @@ def cmd_verify(args):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="知乎 -> 思源 写入流水线")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("create")
     p.add_argument("--notebook", required=True)
     p.add_argument("--articles", required=True)
-    p.add_argument("--extract-dir", default="zhihu_extract")
+    p.add_argument("--extract-dir", required=True)
+    p.add_argument("--author", default="")
+    p.add_argument("--author-token", default="")
+    p.add_argument("--author-about", default="")
 
-    p = sub.add_parser("rebuild")
-    p.add_argument("--notebook", required=True)
-    p.add_argument("--articles", required=True)
-    p.add_argument("--extract-dir", default="zhihu_extract")
+    g = sub.add_parser("gen-articles")
+    g.add_argument("--state", required=True)
+    g.add_argument("--articles", required=True)
 
-    p = sub.add_parser("fix-assets")
-    p.add_argument("--notebook", required=True)
-    p.add_argument("--articles", required=True)
-    p.add_argument("--extract-dir", default="zhihu_extract")
+    v = sub.add_parser("verify")
+    v.add_argument("--articles", required=True)
+    v.add_argument("--extract-dir", required=True)
 
-    p = sub.add_parser("verify")
-    p.add_argument("--articles", required=True)
-    p.add_argument("--extract-dir", default="zhihu_extract")
-
-    args = ap.parse_args()
-    {"create": cmd_create, "rebuild": cmd_rebuild,
-     "fix-assets": cmd_fix_assets, "verify": cmd_verify}[args.cmd](args)
+    args = parser.parse_args()
+    if args.cmd == "create":
+        cmd_create(args)
+    elif args.cmd == "gen-articles":
+        cmd_gen_articles(args)
+    elif args.cmd == "verify":
+        cmd_verify(args)
 
 
 if __name__ == "__main__":

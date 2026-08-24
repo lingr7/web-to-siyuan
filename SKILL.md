@@ -1,14 +1,14 @@
 ---
-name: zhihu-to-siyuan
-description: "将知乎内容（回答/想法/专栏）完整抓取并保存为思源笔记（SiYuan）文档，包含正文文字与图片按原文位置保存。触发场景：用户分享知乎链接要求保存到思源笔记、存成笔记、收藏到思源。涵盖两条链路：快速纯文本归档（WebFetch），以及完整保真链路（Playwright 本机 Chrome 无头抓取 + 图片下载 + 思源 API 写入），并包含思源 API 的多个关键坑位（标题不生效、updateBlock 根块不持久化、资产落错目录等）。"
+name: web-to-siyuan
+description: "将知乎内容（回答/想法/专栏）与微信公众号文章（mp.weixin.qq.com）完整抓取并保存为思源笔记（SiYuan）文档，包含正文文字与图片按原文位置保存。触发场景：用户分享知乎链接或微信公众号链接要求保存到思源笔记、存成笔记、收藏到思源；或要求归档某答主的全部回答/合集（答主合集模式：递归链接发现 + 批量提取 + 主文档/子文档批量入库）。涵盖多条链路：快速纯文本归档（WebFetch）、完整保真链路（Playwright 本机 Chrome 无头抓取 + 图片下载 + 思源 API 写入）、剪藏失败笔记批量重建（zhihu_reclip.py）、答主合集递归发现（recursive_crawler.js + author_pipeline.py），并包含思源 API 的多个关键坑位（标题不生效、updateBlock 根块不持久化、资产落错目录等）。"
 agent_created: true
 ---
 
-# Zhihu to SiYuan
+# Web Clip to SiYuan（原 Zhihu to SiYuan）
 
 ## Overview
 
-将知乎内容抓取并存入思源笔记。有两条链路，按需选择：
+将知乎内容（回答/想法/专栏）与微信公众号文章抓取并存入思源笔记。有两条链路，按需选择：
 
 | 链路 | 工具 | 文字 | 图片 | 适用 |
 |---|---|---|---|---|
@@ -36,12 +36,13 @@ npm install playwright
 [
   {"idx": "01", "type": "answer",  "url": "https://www.zhihu.com/question/xxx/answer/yyy", "title": "问题标题", "docId": ""},
   {"idx": "02", "type": "pin",     "url": "https://www.zhihu.com/pin/xxx", "title": "想法开头…", "docId": ""},
-  {"idx": "03", "type": "article", "url": "https://zhuanlan.zhihu.com/p/xxx", "title": "专栏标题", "docId": ""}
+  {"idx": "03", "type": "article", "url": "https://zhuanlan.zhihu.com/p/xxx", "title": "专栏标题", "docId": ""},
+  {"idx": "04", "type": "weixin",  "url": "https://mp.weixin.qq.com/s/xxx", "title": "文章标题", "docId": ""}
 ]
 ```
 
-- `type`: answer（回答）/ pin（想法）/ article（专栏）
-- `title`: pin 没有标题，取正文开头若干字
+- `type`: answer（回答）/ pin（想法）/ article（专栏）/ **weixin（微信公众号文章）**
+- `title`: pin 没有标题，取正文开头若干字；weixin 取页面 `<h1 id="activity-name">` 或 document.title
 - `docId` 留空，create 后自动回写
 
 ### Step 2: 验证思源 API 并获取笔记本
@@ -118,6 +119,8 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 6. **asset/upload 文件字段名是 `file[]`**，不是 `files[]`/`file`。
 7. **SQL 查询端点是 `/api/query/sql`**，参数名 `stmt`（不是 sql）。图片在导出的 markdown 里是内联语法，SQL 中 type='img' 查不到独立块。
 8. **JSON 转义**：标题/正文含引号时，不要用 shell 拼 JSON，用 Python 脚本构造请求体。
+9. **（2026-08-16 受控实验验证）createDocWithMd 的 `path` 是含标题的完整 hpath，不是父目录**：传 `/目录/标题` 会在该位置建出以此命名的文档，`title` 参数不生效（实测 title 被忽略）。传 `/` 则在根目录建"未命名文档"。另：**`removeDoc` 的 `path` 必须是物理 ID 路径 `/<parent_id>/<doc_id>.sy`（不带 notebook 前缀）**，传 hpath 或带 notebook 前缀的路径都会 `block not found`。`getBlockInfo` 返回的 `path` 含 notebook 前缀（`/<nb_id>/...`），需剥掉首段再用；其 `hpath` 字段恒为 None，层级信息只能从 state/外部记录获取。
+10. **（2026-08-16 教训）URL 归一化必须补 scheme**：从笔记正文提取的链接可能是 `www.zhihu.com/...` 无 `https://` 前缀（印象笔记剪藏产物常见）。危害：a) Playwright `page.goto()` 抛 invalid URL 直接失败；b) 排序时无 scheme 的 URL 全部排在有 scheme 之后，批量抓取会"先难后易"集中崩溃；c) `来源：[知乎](url)` 链接不可点击。修复：normalize 环节 `startswith(('http://','https://'))` 判断 + 补 `https://`。**注意：URL 归一化规则变更会使 url_hash 漂移，存量 state 需一次性迁移（重算哈希、按深度合并冲突）。**
 
 ## Key Learnings（知乎反爬与抓取要点）
 
@@ -131,6 +134,18 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 8. **纯图片回答存在**：有的回答正文只有一张图无文字（blocks 里只有 img），不是抓取失败。
 9. **超链接保留**（2026-08-16 修复）：抓取时切勿用 `innerText` 提取文本（会丢弃全部 `<a href>`）。`zhihu_extract.js` 的 `mdInline()` 会把 `<a>` 序列化为 `[文本](URL)` markdown，并自动解开知乎 `link.zhihu.com/?target=` 跳转为真实 URL。写入端（createDocWithMd / insertBlock dataType=markdown）原生支持链接语法。注意：verify 命中率会因链接语法略降（SiYuan 导出格式差异），属预期。
 10. **链接卡片（LinkCard）懒加载陷阱**（2026-08-16 修复）：正文里的知乎问题卡片是 `<a>` + `.LinkCard-title.loading`，标题**依赖可视区懒加载**；不滚动的无头抓取拿到的是空标题，若直接丢弃空 label 的 `<a>` 会**静默丢失整批卡片链接**（实测丢 6 个）。修复（已实装 zhihu_extract.js）：a) 空 label 的 `<a>` 先标记为 `[__LINKCARD__](url)`；b) 抓取后批量调知乎编辑器元数据 API `GET /api/v4/editor/link_card_infos?scene=pcweb&urls=<逗号连接>`（用 `context.request.get` 带浏览器 Cookie），从返回的 `extra_info` JSON 取 `title` 回填；失败兜底 `[链接](url)`；c) 另有 `waitForFunction` 等待已加载卡片的兜底。
+11. **（2026-08-16 教训）批量抓取脚本的三条命脉**：a) **单条处理链（含 LinkCard 补标题、图片下载、文件落盘）必须整链 try-catch**——只有抓取部分有 try 的话，浏览器在下载图片环节崩溃就会杀死整个进程，后续 100+ 条全部丢；b) **summary.json 增量落盘**（每处理完一条就写），不要循环结束才写——否则崩溃时全部汇总丢失；c) **定期重启浏览器**（每 ~15 条）：知乎页面渲染几十个后 Chrome 内存暴涨，是批量中段异常的主因。另有：403 降级页正文渲染慢，用 `waitForFunction` 条件等待容器出现（25s）而非固定 sleep；单条 3 次重试每次开新 page，第 3 次失败重启整个浏览器。
+12. **（2026-08-16 教训）抓取结果判定不能只看文件存在**：blocks 文件存在但 `ok:false` 或 `blocks:[]` 的，Python 侧必须读文件内容判定，否则失败项被误标 `fetched`、rebuild 时报"正文为空"误归因，且重跑 fetch 会跳过它们。同理，fetch 进程崩溃后未处理的 URL 应归因为"未处理（进程中断）"而非"反爬失败"——两者处理方式完全不同（后者会被无意义地反复重试）。
+
+## Key Learnings（微信公众号抓取要点）
+
+1. **type='weixin'**：URL 形如 `https://mp.weixin.qq.com/s/xxx`。正文容器用 `#js_content`（`.rich_media_content` 是外层稳定容器，内部 `#js_content` 才是实际内容）。
+2. **图片懒加载**：微信正文 `<img>` 的 `src` 常为空，真实地址在 **`data-src`** 属性（`mmbiz.qpic.cn` 域名）。提取顺序：`data-src` → `data-original` → `data-actualsrc` → `src`（与知乎共用 `pickImgSrc`，注意该函数必须定义在 EXTRACT_FN 内部，evaluate 序列化不携带外部引用）。
+3. **图片防盗链**：下载需带 `Referer`（文章 URL 即可），与知乎同一套 `context.request.get` 机制。
+4. **标题**：取 `<h1 id="activity-name">` 或 `document.title`（格式 "文章标题"），由调用方填入 articles.json 的 `title` 字段。
+5. **链接卡片不适用**：微信正文无 LinkCard 懒加载，`fillLinkCardTitles` 直接跳过（无 `__LINKCARD__` 占位符）。
+6. **来源标注**：siyuan_pipeline.py 按域名区分来源行——`mp.weixin.qq.com` → `> 来源：[微信公众号](url)`，其余 → `> 来源：[知乎](url)`。
+7. **已验证**：2026-08-23 实测微信文章抓取（18 文本块+3 图）、写入、verify 100% 命中、fix-assets 3/3 就位。
 
 ## 批量模式：剪藏失败笔记重建（zhihu_reclip.py）
 
@@ -139,27 +154,70 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 ```bash
 cd scripts
 python zhihu_reclip.py scan      # 扫描识别失败笔记（四重策略防漏）
-python zhihu_reclip.py delete    # 删除旧失败文档
+python zhihu_reclip.py delete    # 删除旧失败文档（process 模式用）
 python zhihu_reclip.py fetch     # 自动生成 articles.json 并调用 zhihu_extract.js 批量抓取
 python zhihu_reclip.py process   # 创建新文档（垃圾过滤+图片内联+fix-assets）
+python zhihu_reclip.py rebuild   # 逐条在原文档上重建内容（不删除原 doc，保留原路径+doc_id）
 python zhihu_reclip.py verify    # 验证标题+内容命中率
 python zhihu_reclip.py report    # 最终报告（含可点击 deep link）
 python zhihu_reclip.py status    # 随时查看进度（只读）
 python zhihu_reclip.py reset <hash>  # 重置单条状态重试
 ```
 
+**两种重建模式**：
+- `delete → fetch → process`：删除旧文档 → 在根目录新建文档（doc_id 变化，原路径丢失）
+- `fetch → rebuild`：保留原文档 → 在原位重建内容（删子块+insertBlock+标题修复+fix-assets，doc_id 和路径不变）。**逐条处理、每条存盘**，中断后重跑即恢复
+
 要点（千条规模实战设计）：
-- **状态机 + 断点续传**：`pending → deleted → fetched → created → verified → done`，任何时刻中断重跑即恢复
+- **状态机 + 断点续传**：`pending → deleted → fetched → created/rebuilt → verified → done`，任何时刻中断重跑即恢复
 - **运行数据与代码分离**：状态/缓存/日志写 `D:\zhihu-reclip-data`（环境变量 `RECLIP_DATA_DIR` 覆盖），不污染 skill 目录
 - **扫描四重策略取并集**：思源 SQL 有索引 bug（`type='d'` 批量查询随机漏文档），必须加**文件树 API 递归遍历**兜底
 - **notebook_id 每次校验刷新**：状态里存的笔记本可能已删除/重建
+- **rebuild 逐条存盘**：每条 rebuild 后立即 save_state，中断不丢已完成进度
 - API 限流 0.15s、指数退避重试、原子写入（临时文件+rename）
+
+## 答主合集模式：递归发现 + 批量入库（recursive_crawler.js + author_pipeline.py）
+
+当需要把**某个答主的全部回答**归档（常见于：答主开启隐私保护/改匿名，主页 `/answers` 列表为空、`/api/v4/members/<token>/answers` 返回 0 条，无法直接枚举）时，用**递归链接发现**替代直列：从少量已知回答出发，沿正文里的知乎链接扩散，逐页校验作者，直到覆盖饱和。
+
+```bash
+# 1. 递归发现（从已知回答 URL 出发；INITIAL_URLS 需手改脚本头部）
+node recursive_crawler.js                 # 产出 crawl_state.json（断点续爬）
+# 2. 生成待抓清单（自动跳过已完成篇目；保留已回写 docId 防重复建文档）
+python author_pipeline.py gen-articles --state zhihu_author_extract/crawl_state.json --articles zhihu_author_extract/articles.json
+# 3. 提取正文+图片（复用链路 B 的 zhihu_extract.js，含 LinkCard 补标题）
+node zhihu_extract.js zhihu_author_extract/articles.json zhihu_author_extract
+# 4. 写入思源（主文档=答主档案+目录，子文档=每篇回答）
+python author_pipeline.py create --notebook <笔记本ID> --articles zhihu_author_extract/articles.json --extract-dir zhihu_author_extract --author "答主名" --author-token <token> --author-about "<简介>"
+# 5. 验证 + deep link
+python author_pipeline.py verify --articles zhihu_author_extract/articles.json --extract-dir zhihu_author_extract
+```
+
+**核心机制**：
+- **严格作者匹配**：只检查目标 `.AnswerItem` 内部 `.AuthorInfo a[href*="/people/"]` 是否含目标 token——绝不能全页扫描 `/people/` 链接（其他答主正文引用目标答主时会出现指向其主页的链接，导致误判）
+- **verified 标记**：discovered 条目确认后打 `verified:true`，续跑时只重验未验证条目，避免每次重启全量重访
+- **reverify 清除旧误判**：旧版本误收的条目，重验发现不是目标答主即从 discovered 删除
+- **三型页面分路处理**：回答页（严格校验+提取链接）/ 问题页（扫首屏 AnswerItem 找目标答主 + 提取全页链接）/ 专栏页（作者校验走 `.AuthorInfo`、`follow-author`、`js-initialData` 兜底）
+
+**反爬与长跑铁律**（2026-08-16 实战，全部踩过坑）：
+1. **同一时刻只允许一个知乎客户端**！爬虫与提取并行 → 两个 Chrome 同时打站 → 403 风控风暴互相拖垮，双双卡死。必须串行：提取完成后才续跑爬虫
+2. **长跑任务分段续跑**：本环境后台任务约 20-40 分钟被回收一次。把大任务拆成可断点续传的小段——每轮 `gen-articles` 自动跳过已有 blocks 的篇目（pending.json），被清理后重启即续，进度不丢
+3. **日志用文件重定向，别依赖 stdout 管道**：`>> extract.log 2>&1`。后台任务 stdout 管道被清理后 console.log 抛 EPIPE，若异常处理器又调 console.log 会无限递归（实测 crawl.log 膨胀到 803MB）
+4. **单客户端下 403 自动缓解**：提取脚本内置降级页等待自愈；爬虫 goto 三连败回队重试（RETRY_MAX=3），超过放弃不卡死
+5. **递归发现的覆盖上限**：只能找到"被其他页面链接到"的回答，孤立回答不可达（答主 1283 篇实测仅发现 84 篇，且高度集中于少数父回答）。如需要更高覆盖，可补充知乎站内搜索 API（页面内 fetch 带 Cookie）等渠道
+
+**author_pipeline.py 要点**：
+- `gen-articles` 按 URL 排序生成稳定 idx；**保留已有 docId**——重复运行 create 不会重建已建文档
+- create 复用链路 B 全部坑位经验：主文档幂等（SQL 查标题）、标题两步修复（renameDoc + setBlockAttrs）、子文档 path 前缀 `/{父id}.sy/`、fix-assets 资产归位并回读校验
+- verify 命中率 ≥90% 即合格；略低只因正文含超链接锚点语法，属预期
 
 ## Scripts & Docs
 
 - `scripts/zhihu_extract.js` — Playwright 抓取（blocks 结构 + 图片下载），用法 `node zhihu_extract.js <articles.json> [outdir]`
 - `scripts/siyuan_pipeline.py` — 思源写入流水线，子命令 create / rebuild / fix-assets / verify
 - `scripts/zhihu_reclip.py` — 批量模式：剪藏失败笔记扫描/重建/验证（千条规模，断点续传），运行数据写 `D:\zhihu-reclip-data`
+- `scripts/recursive_crawler.js` — 答主合集模式：递归链接发现（断点续爬 + verified 标记 + 崩溃兜底）
+- `scripts/author_pipeline.py` — 答主合集模式：gen-articles / create / verify（主文档+子文档批量入库）
 - `examples/articles.example.json` — 输入配置格式示例
 - `docs/siyuan-api-pitfalls.md` — 思源 API 坑位详解
 - `docs/zhihu-anti-scraping.md` — 知乎反爬与抓取要点
