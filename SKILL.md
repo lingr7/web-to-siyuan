@@ -1,6 +1,6 @@
 ---
 name: web-to-siyuan
-description: "将知乎内容（回答/想法/专栏）与微信公众号文章（mp.weixin.qq.com）完整抓取并保存为思源笔记（SiYuan）文档，包含正文文字与图片按原文位置保存。触发场景：用户分享知乎链接或微信公众号链接要求保存到思源笔记、存成笔记、收藏到思源；或要求归档某答主的全部回答/合集（答主合集模式：递归链接发现 + 批量提取 + 主文档/子文档批量入库）。涵盖多条链路：快速纯文本归档（WebFetch）、完整保真链路（Playwright 本机 Chrome 无头抓取 + 图片下载 + 思源 API 写入）、剪藏失败笔记批量重建（zhihu_reclip.py）、答主合集递归发现（recursive_crawler.js + author_pipeline.py），并包含思源 API 的多个关键坑位（标题不生效、updateBlock 根块不持久化、资产落错目录等）。"
+description: "将知乎内容（回答/想法/专栏）与微信公众号文章（mp.weixin.qq.com）完整抓取并保存为思源笔记（SiYuan）文档，包含正文文字与图片按原文位置保存。触发场景：用户分享知乎链接或微信公众号链接要求保存到思源笔记、存成笔记、收藏到思源；或要求归档某答主的全部回答/合集（答主合集模式：递归链接发现 + 批量提取 + 主文档/子文档批量入库）。涵盖多条链路：快速纯文本归档（WebFetch）、完整保真链路（Playwright 本机 Chrome 无头抓取 + 图片下载 + 思源 API 写入）、剪藏失败笔记批量重建（zhihu_reclip.py）、答主合集递归发现（recursive_crawler.js + author_pipeline.py），并包含思源 API 的多个关键坑位（标题不生效、updateBlock 根块不持久化、资产落错目录等），以及知乎风控降级页（403 → undefined_blocks.json）的抢救与预防。"
 agent_created: true
 ---
 
@@ -136,6 +136,8 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 10. **链接卡片（LinkCard）懒加载陷阱**（2026-08-16 修复）：正文里的知乎问题卡片是 `<a>` + `.LinkCard-title.loading`，标题**依赖可视区懒加载**；不滚动的无头抓取拿到的是空标题，若直接丢弃空 label 的 `<a>` 会**静默丢失整批卡片链接**（实测丢 6 个）。修复（已实装 zhihu_extract.js）：a) 空 label 的 `<a>` 先标记为 `[__LINKCARD__](url)`；b) 抓取后批量调知乎编辑器元数据 API `GET /api/v4/editor/link_card_infos?scene=pcweb&urls=<逗号连接>`（用 `context.request.get` 带浏览器 Cookie），从返回的 `extra_info` JSON 取 `title` 回填；失败兜底 `[链接](url)`；c) 另有 `waitForFunction` 等待已加载卡片的兜底。
 11. **（2026-08-16 教训）批量抓取脚本的三条命脉**：a) **单条处理链（含 LinkCard 补标题、图片下载、文件落盘）必须整链 try-catch**——只有抓取部分有 try 的话，浏览器在下载图片环节崩溃就会杀死整个进程，后续 100+ 条全部丢；b) **summary.json 增量落盘**（每处理完一条就写），不要循环结束才写——否则崩溃时全部汇总丢失；c) **定期重启浏览器**（每 ~15 条）：知乎页面渲染几十个后 Chrome 内存暴涨，是批量中段异常的主因。另有：403 降级页正文渲染慢，用 `waitForFunction` 条件等待容器出现（25s）而非固定 sleep；单条 3 次重试每次开新 page，第 3 次失败重启整个浏览器。
 12. **（2026-08-16 教训）抓取结果判定不能只看文件存在**：blocks 文件存在但 `ok:false` 或 `blocks:[]` 的，Python 侧必须读文件内容判定，否则失败项被误标 `fetched`、rebuild 时报"正文为空"误归因，且重跑 fetch 会跳过它们。同理，fetch 进程崩溃后未处理的 URL 应归因为"未处理（进程中断）"而非"反爬失败"——两者处理方式完全不同（后者会被无意义地反复重试）。
+13. **（2026-08-27 教训）风控降级页的二次事故——`undefined_blocks.json`**：遇到 403 降级页时整篇正文被折叠为单块，且 `data-zop` 解析失败 → itemId 丢失 → 抓取产物落盘为 `undefined_blocks.json`（正常应为 `{idx}_blocks.json`）。抢救流程（277 块实战验证）：a) 清理 zhida 卡片链接等噪音；b) 按句末标点+空格切分恢复块结构；c) 重命名为 `{idx}_blocks.json` 后走正常 pipeline 入库。预防：articles.json 每条必须带 `idx` 字段；抓取完成后检查产物文件名，出现 `undefined_*` 即判定为降级页事故，不要直接入库。
+14. **（2026-08-26 验证）WebFetch 预览会混入同页其他回答**：多回答页面上 WebFetch 给出的内容可能来自别的答主，Playwright 按 itemId 锚定抓到的才是目标回答。怀疑漏抓/错抓时写 debug 脚本 dump 全量块与原文逐段比对，不要只看文件存在。
 
 ## Key Learnings（微信公众号抓取要点）
 
