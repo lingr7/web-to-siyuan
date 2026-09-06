@@ -6,6 +6,8 @@ agent_created: true
 
 # Web Clip to SiYuan（原 Zhihu to SiYuan）
 
+> **姊妹 skill**：单文件/邮件附件归档（不走网页抓取）→ `save-file-to-siyuan`。本文档的 Key Learnings 是两个 skill 共用的思源 API 坑位权威参考。
+
 ## Overview
 
 将知乎内容（回答/想法/专栏）与微信公众号文章抓取并存入思源笔记。有两条链路，按需选择：
@@ -115,12 +117,15 @@ http://127.0.0.1:6806/stage/build/desktop/?id=<doc_id>
 2. **createDocWithMd 标题不生效**：文档会显示"未命名文档"。必须 `renameDoc` + `setBlockAttrs(custom-sy-title-empty="false", title=...)` 两步都做。
 3. **updateBlock 对文档根块（type=d）静默失败**：返回 code=0 但内容不持久化。改用「查子块 id → 逐个 deleteBlock → insertBlock(parentID=doc_id)」重建。
 4. **（2026-08-16 修正）deleteBlock 参数名是 `id`，不是 `blockID`**：传 `blockID` 返回 code=0 但静默空操作（data=null；真正删除时 data 含 delete 操作记录）。曾误判为"思源 API bug"，受控对照实验定位为脚本参数名错误——曾因此导致 rebuild 残留旧块 + 追加新块 = 文档内容重复。另：**SQL 查 blocks 表有异步索引延迟，不是随机漏行**（2026-08-16 受控实验：快速写 30 块后 SQL 只报 29，约 4 秒后收敛到 32，同一时刻重复查询结果稳定）。写入后立刻用 SQL 查会"缺行"，这是思源已知设计（数据异步写入索引，官方在 ld246 有说明，关联 issue siyuan-note/siyuan#3212）。查刚写入的块一律用 `/api/block/getChildBlocks`（实时、不走索引）。rebuild_doc 已内置：删除后循环校验 + 失败降级 removeDoc 整篇重建（doc_id 会变，回写 articles.json）。
-5. **/api/asset/upload 落错目录**：上传的文件存到全局 `/data/assets/`，而文档内 `assets/xxx` 相对链接按笔记本目录解析 → 图片 404。修复：用 `/api/file/getFile` 读出，再 `/api/file/putFile` 写到 `/data/<notebook>/assets/`（siyuan_pipeline.py 的 fix-assets 子命令）。
+5. **/api/asset/upload 落错目录**：上传的文件存到全局 `/data/assets/`，而文档内 `assets/xxx` 相对链接按笔记本目录解析 → 图片 404。修复：用 `/api/file/getFile` 读出，再 `/api/file/putFile` 写到 `/data/<notebook>/assets/`（siyuan_pipeline.py 的 fix-assets 子命令）。**（2026-08-30 受控复测补充：全局 assets 的带时间戳文件实测 `GET /assets/<ts名>` 返回 200，`/assets/` 路由按文件名跨目录搜索（笔记本 + 全局）并在全局留副本；"落全局必 404"已过时。fix-assets 归位笔记本仍推荐——语义内聚、原名保留。putFile 直传笔记本 assets 同样实测可用，见坑位 8。）**
 6. **asset/upload 文件字段名是 `file[]`**，不是 `files[]`/`file`。
 7. **SQL 查询端点是 `/api/query/sql`**，参数名 `stmt`（不是 sql）。图片在导出的 markdown 里是内联语法，SQL 中 type='img' 查不到独立块。
 8. **JSON 转义**：标题/正文含引号时，不要用 shell 拼 JSON，用 Python 脚本构造请求体。
 9. **（2026-08-16 受控实验验证）createDocWithMd 的 `path` 是含标题的完整 hpath，不是父目录**：传 `/目录/标题` 会在该位置建出以此命名的文档，`title` 参数不生效（实测 title 被忽略）。传 `/` 则在根目录建"未命名文档"。另：**`removeDoc` 的 `path` 必须是物理 ID 路径 `/<parent_id>/<doc_id>.sy`（不带 notebook 前缀）**，传 hpath 或带 notebook 前缀的路径都会 `block not found`。`getBlockInfo` 返回的 `path` 含 notebook 前缀（`/<nb_id>/...`），需剥掉首段再用；其 `hpath` 字段恒为 None，层级信息只能从 state/外部记录获取。
 10. **（2026-08-16 教训）URL 归一化必须补 scheme**：从笔记正文提取的链接可能是 `www.zhihu.com/...` 无 `https://` 前缀（印象笔记剪藏产物常见）。危害：a) Playwright `page.goto()` 抛 invalid URL 直接失败；b) 排序时无 scheme 的 URL 全部排在有 scheme 之后，批量抓取会"先难后易"集中崩溃；c) `来源：[知乎](url)` 链接不可点击。修复：normalize 环节 `startswith(('http://','https://'))` 判断 + 补 `https://`。**注意：URL 归一化规则变更会使 url_hash 漂移，存量 state 需一次性迁移（重算哈希、按深度合并冲突）。**
+11. **（2026-08-30）通用端点调用格式（三个坑）**：a) `/api/file/putFile` 走 **multipart/form-data + 表单字段 `path`**，不是 JSON body、也不是 query 参数——Learning 5 的 fix-assets 已隐式使用，但格式未记录；b) `createDocWithMd` 在 `/api/filetree/` 下，**返回的 `data` 直接是 doc_id 字符串**（不是对象、不用再查一层）；c) `renameDoc`（`/api/filetree/renameDoc`）参数是 **`notebook + path(以 .sy 结尾的物理路径) + title`**，不是 `id + title`。
+12. **（2026-09-06 教训）is_junk 垃圾过滤误杀长正文**：无锚点的 `\d+\s*赞同` 模式会把内嵌关联文章卡片的正文段整块误杀——专栏正文里「…巨大离婚收益**58 赞同 · 8 评论** 文章」是卡片标题的一部分，不是元信息（实测 02 前言段 400+ 字整块被过滤，verify 91% 未命中即此因）。修复：`is_junk` 加长度守卫——`len(text) >= 30` 的长块一律不过滤（真元信息块都 <30 字）。**改动后必查脚本里有无重复定义**（本次旧 `is_junk` 在 140 行还有一份，Python 后定义覆盖，差点白修）。
+13. **（2026-09-06 教训）rebuild 的 removeDoc 降级路径会静默变更 doc_id**：rebuild 输出 `OK xx 字符` 不代表成功——若内部触发「失败降级 removeDoc 整篇重建」，原 doc 被删、新 doc_id 生成，但 articles.json **不会自动回写**。rebuild 后必须 `getChildBlocks` 实测（0 块 = 事故）；`getBlockInfo` 返回 not found 即触发过 removeDoc，需手动 create + 回写 docId。安全 SOP：备份 articles.json → 记录原块数 → rebuild → getChildBlocks 验证 → 异常时按"清空 docId → create → 手动回写"抢救。
 
 ## Key Learnings（知乎反爬与抓取要点）
 

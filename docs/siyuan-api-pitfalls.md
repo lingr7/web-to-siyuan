@@ -47,3 +47,9 @@ post_json("/api/attr/setBlockAttrs", {
 ## 7. JSON 转义
 
 标题/正文含引号（中文引号也会）时，不要用 shell 拼 JSON，用 Python 脚本构造请求体（`json.dumps` 自动转义）。
+
+## 8. 通用端点调用格式（2026-08-30 补充）
+
+- **`/api/file/putFile` 走 multipart/form-data**，目标路径放表单字段 `path`（值如 `/data/<notebook>/assets/xxx.jpg`），文件放 `file` 字段。不是 JSON body，也不是 header/query 参数。
+- **`createDocWithMd` 的返回 `data` 直接是 doc_id 字符串**（不是对象），建文档后无需二次查询即可拿 id。
+- **`renameDoc` 参数是 `notebook + path + title`**：`path` 必须是以 `.sy` 结尾的物理路径（如 `/<parent_id>/<doc_id>.sy`），不是 `id + title`。与坑位 2 的示例一致。

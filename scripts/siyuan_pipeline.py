@@ -53,6 +53,15 @@ JUNK_PATTERNS = [
 ]
 
 
+def is_junk(text):
+    # 2026-09-06 教训：专栏正文可内嵌关联文章卡片，标题含「58 赞同 · 8 评论」字样，
+    # 无锚点的 \d+\s*赞同 会把整段正文误杀（02 前言段 400+ 字整块被过滤）。
+    # 守卫：真正的赞数元信息块都很短（<30 字），长正文即使命中模式也保留。
+    if len(text.strip()) >= 30:
+        return False
+    return any(p.search(text) for p in JUNK_PATTERNS)
+
+
 # ---------- 基础 API ----------
 
 def post_json(endpoint, payload):
@@ -127,10 +136,6 @@ def upload_asset(filepath, rename_prefix):
 
 
 # ---------- 内容构建 ----------
-
-def is_junk(text):
-    return any(p.search(text) for p in JUNK_PATTERNS)
-
 
 def build_body(idx, blocks, img_dir):
     """blocks -> markdown 正文（文本段落 + 图片按原位置内联）"""
