@@ -13,3 +13,7 @@ __pycache__/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 会话工作区产物
+work/
+extract.log
